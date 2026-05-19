@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YouTube 채널 관심도 분석기</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+
+  <!-- 헤더 -->
+  <header>
+    <div class="label">// YouTube Channel Analyzer</div>
+    <h1>구독 채널<br><span>관심도 분석기</span></h1>
+    <p class="subtitle">
+      Google OAuth로 본인 계정에 연결하고<br>
+      구독 채널을 관심도 순으로 분석합니다.
+    </p>
+  </header>
+
+  <!-- 진행 단계 -->
+  <div class="progress-steps" id="progressSteps">
+    <div class="progress-step">
+      <div class="step-circle active" id="pc1">1</div>
+      <div class="step-label active" id="pl1">키 입력</div>
+    </div>
+    <div class="progress-step">
+      <div class="step-circle" id="pc2">2</div>
+      <div class="step-label" id="pl2">Google 로그인</div>
+    </div>
+    <div class="progress-step">
+      <div class="step-circle" id="pc3">3</div>
+      <div class="step-label" id="pl3">데이터 수집</div>
+    </div>
+    <div class="progress-step">
+      <div class="step-circle" id="pc4">4</div>
+      <div class="step-label" id="pl4">분석 완료</div>
+    </div>
+  </div>
+
+  <!-- Step 1: 키 입력 (서버가 client_id를 주입하면 자동 숨김) -->
+  <div class="card" id="keySection" style="display:{% if client_id %}none{% else %}block{% endif %}">
+    <div class="section-title">1단계 · OAuth 클라이언트 ID 입력</div>
+    <div class="input-col">
+      <div class="input-row">
+        <input type="text" id="clientId" placeholder="OAuth 2.0 클라이언트 ID (숫자....apps.googleusercontent.com)"/>
+      </div>
+      <div class="input-row">
+        <button class="btn" style="width:100%" onclick="initOAuth()">Google 로그인 준비</button>
+        <button class="btn btn-secondary" onclick="showGuide()">설정 안내</button>
+      </div>
+    </div>
+    <p class="hint">
+      <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a>에서 발급한 OAuth 클라이언트 ID 하나만 있으면 됩니다.
+      입력값은 브라우저에서만 사용되며 외부로 전송되지 않습니다.
+    </p>
+  </div>
+
+  <!-- Step 2: OAuth 로그인 -->
+  <div class="card" id="oauthSection" style="display:none">
+    <div class="section-title">2단계 · Google 계정 연결</div>
+    <div id="oauthStatus" class="oauth-status disconnected">
+      <span class="status-dot"></span>
+      <span>아직 연결되지 않았습니다.</span>
+    </div>
+    <div id="userProfile" style="display:none"></div>
+    <div class="input-row" id="oauthBtns">
+      <button class="btn btn-green" style="width:100%" onclick="startOAuth()">
+        🔐 Google 계정으로 로그인
+      </button>
+    </div>
+    <p class="hint">
+      클릭하면 Google 로그인 팝업이 열립니다.<br>
+      YouTube 구독 데이터 읽기 권한(youtube.readonly)을 허용해주세요.
+    </p>
+  </div>
+
+  <!-- Step 3: 분석 시작 -->
+  <div class="card" id="analyzeSection" style="display:none">
+    <div class="section-title">3단계 · 분석 시작</div>
+
+    <div class="takeout-box">
+      <div class="takeout-title">📁 (선택) Google Takeout 파일 업로드</div>
+      <div class="takeout-hint">
+        업로드하면 <b>정확한 댓글 수</b>와 <b>채널별 마지막 시청일</b>을 점수에 반영합니다.<br>
+        <a href="https://takeout.google.com/" target="_blank" rel="noopener">takeout.google.com</a> → "YouTube 및 YouTube Music" → <code>comments</code> · <code>history</code> 선택 → 내보내기.<br>
+        압축파일 안의 <code>comments.csv</code> / <code>watch-history.json</code> 을 한 개씩 또는 둘 다 업로드 (재선택으로 추가 가능).<br>
+        업로드하지 않으면 댓글은 API 근사값, 시청 기록은 미반영.
+      </div>
+      <label class="takeout-drop" for="takeoutFile" id="takeoutDrop">
+        <span id="takeoutLabel">📂 파일 선택</span>
+      </label>
+      <input type="file" id="takeoutFile" accept=".csv,.html,.htm,.json,.txt" onchange="handleTakeoutFile(this)" hidden>
+      <div id="takeoutStatus" class="takeout-status"></div>
+    </div>
+
+    <div class="input-row">
+      <button class="btn" style="width:100%" onclick="startAnalysis()">🚀 채널 관심도 분석 시작</button>
+    </div>
+    <p class="hint">구독 채널 수에 따라 10초~1분 정도 소요될 수 있습니다.</p>
+  </div>
+
+  <!-- 데모 -->
+  <div class="demo-bar">
+    <span class="divider-text">또는</span>
+    <button class="btn btn-secondary" onclick="loadDemo()">샘플 데이터로 데모 실행</button>
+  </div>
+
+  <!-- 로딩 -->
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div class="loading-steps" id="loadingSteps">
+      <div class="loading-step" id="step1">구독 채널 목록 수집 중... (페이지네이션)</div>
+      <div class="loading-step" id="step2">좋아요 영상 목록 집계 중... (해시맵)</div>
+      <div class="loading-step" id="step3">채널별 내 댓글 수 집계 중... (commentThreads, 병렬 배치)</div>
+      <div class="loading-step" id="step4">서버에서 관심도 점수 계산 중... (지수 평활법)</div>
+      <div class="loading-step" id="step5">서버에서 힙 정렬로 내림차순 정렬 중...</div>
+    </div>
+  </div>
+
+  <!-- 에러 -->
+  <div class="error-box" id="errorBox"></div>
+
+  <!-- 결과 -->
+  <div class="results" id="results">
+    <div class="summary-grid" id="summaryGrid"></div>
+    <div class="filter-bar" id="filterBar"></div>
+    <div class="channel-list" id="channelList"></div>
+  </div>
+
+</div>
+
+<!-- 안내 모달 -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h2>설정 안내</h2>
+    <ul class="step-list">
+      <li>
+        <span class="step-num">1</span>
+        <span><a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent2)">Google Cloud Console</a> 접속 → 새 프로젝트 생성</span>
+      </li>
+      <li>
+        <span class="step-num">2</span>
+        <span>API 및 서비스 → 라이브러리 → <strong style="color:var(--text)">YouTube Data API v3</strong> 활성화</span>
+      </li>
+      <li>
+        <span class="step-num">3</span>
+        <span>OAuth 동의 화면 설정 → 범위에 <strong style="color:var(--text)">youtube.readonly</strong> 추가 → 테스트 사용자에 본인 Gmail 추가</span>
+      </li>
+      <li>
+        <span class="step-num">4</span>
+        <span>사용자 인증 정보 → OAuth 클라이언트 ID 만들기 → 유형: <strong style="color:var(--text)">웹 애플리케이션</strong> → 승인된 JavaScript 출처에 현재 페이지 도메인(예: <code>http://127.0.0.1:5000</code>) 추가 → <strong style="color:var(--text)">클라이언트 ID</strong> 복사</span>
+      </li>
+    </ul>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()">닫기</button>
+      <button class="btn" onclick="window.open('https://console.cloud.google.com','_blank');closeModal()">콘솔 열기</button>
+    </div>
+  </div>
+</div>
+
+<!-- 서버 주입 설정 -->
+<script>window.__APP_CONFIG__ = { clientId: {{ client_id|tojson }} };</script>
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client"></script>
+<!-- 앱 스크립트 -->
+<script src="app.js"></script>
+</body>
+</html>
