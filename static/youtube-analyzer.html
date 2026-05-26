@@ -56,6 +56,57 @@
       <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a>에서 발급한 OAuth 클라이언트 ID 하나만 있으면 됩니다.
       입력값은 브라우저에서만 사용되며 외부로 전송되지 않습니다.
     </p>
+
+    <!-- 인라인 발급 가이드 -->
+    <div class="oauth-inline-guide">
+      <div class="oauth-inline-guide-title">📋 클라이언트 ID 발급 절차</div>
+      <ul class="step-list">
+        <li>
+          <span class="step-num">1</span>
+          <span>
+            <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a> 접속 →
+            상단 프로젝트 선택 메뉴에서 <strong>새 프로젝트 만들기</strong>
+            (이름 예: <code>YouTube-Analyzer</code>). 기존 프로젝트가 있으면 재사용 가능.
+          </span>
+        </li>
+        <li>
+          <span class="step-num">2</span>
+          <span>
+            왼쪽 메뉴 → <strong>API 및 서비스 → 라이브러리</strong> →
+            검색창에 <code>YouTube Data API v3</code> 입력 → 결과 클릭 → <strong>사용 설정</strong> 버튼.
+          </span>
+        </li>
+        <li>
+          <span class="step-num">3</span>
+          <span>
+            <strong>API 및 서비스 → OAuth 동의 화면</strong><br>
+            ① User Type: <strong>외부</strong> 선택 → 만들기<br>
+            ② 앱 이름·사용자 지원 이메일·개발자 연락처에 본인 Gmail 입력<br>
+            ③ <strong>범위 추가 또는 삭제</strong> → <code>youtube.readonly</code> 검색 후 체크 → 업데이트<br>
+            ④ <strong>테스트 사용자</strong>에 본인 Gmail 추가 (최대 100명까지 등록 가능)
+          </span>
+        </li>
+        <li>
+          <span class="step-num">4</span>
+          <span>
+            <strong>API 및 서비스 → 사용자 인증 정보</strong> →
+            상단 <strong>+ 사용자 인증 정보 만들기 → OAuth 클라이언트 ID</strong><br>
+            ① 애플리케이션 유형: <strong>웹 애플리케이션</strong><br>
+            ② 이름: 자유 (예: <code>Web Client</code>)<br>
+            ③ <strong>승인된 JavaScript 출처</strong>에 아래 두 개 모두 추가
+            <span class="copy-row">
+              <code class="click-copy" onclick="copyOrigin(this)">http://127.0.0.1:5000</code>
+              <code class="click-copy" onclick="copyOrigin(this)">http://localhost:5000</code>
+            </span>
+            ④ <strong>만들기</strong> → 표시된 <strong>클라이언트 ID</strong>(<code>숫자-문자열.apps.googleusercontent.com</code>) 복사 → 위 입력칸에 붙여넣기
+          </span>
+        </li>
+      </ul>
+      <p class="oauth-inline-guide-note">
+        ⚠️ <strong>클라이언트 시크릿은 사용하지 않습니다.</strong> ID만 복사하세요.<br>
+        ⚠️ "이 앱은 확인되지 않았습니다" 경고가 떠도, 테스트 사용자로 등록된 본인 계정이면 <strong>고급 → 안전하지 않음으로 이동</strong>으로 진행 가능합니다.
+      </p>
+    </div>
   </div>
 
   <!-- Step 2: OAuth 로그인 -->
@@ -128,6 +179,22 @@
     <div class="summary-grid" id="summaryGrid"></div>
     <div class="filter-bar" id="filterBar"></div>
     <div class="channel-list" id="channelList"></div>
+
+    <!-- LLM 추천 -->
+    <div class="recommend-section" id="recommendSection">
+      <div class="recommend-header">
+        <div>
+          <div class="section-title" style="margin-bottom:4px">🤖 AI 채널 추천</div>
+          <div class="recommend-sub">최애·자주 보는 채널을 기반으로 Solar LLM이 새로운 채널을 추천합니다.</div>
+        </div>
+      </div>
+      <div class="recommend-loading" id="recommendLoading" style="display:none">
+        <div class="spinner"></div>
+        <div>Solar LLM이 추천을 생성하는 중... (10~20초)</div>
+      </div>
+      <div class="recommend-error" id="recommendError" style="display:none"></div>
+      <div class="recommend-list" id="recommendList"></div>
+    </div>
   </div>
 
 </div>
@@ -160,6 +227,13 @@
     </div>
   </div>
 </div>
+
+<!-- 플로팅 추천 버튼 (분석 결과가 있을 때만 노출) -->
+<button class="recommend-fab" id="recommendFab" onclick="requestRecommendations()" aria-label="AI 추천 받기" title="AI 추천 받기">
+  <img src="images/like-button.png" alt="추천" class="recommend-fab-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='block'"/>
+  <span class="recommend-fab-fallback" style="display:none">👍</span>
+  <span class="recommend-fab-label">AI 추천</span>
+</button>
 
 <!-- 서버 주입 설정 -->
 <script>window.__APP_CONFIG__ = { clientId: {{ client_id|tojson }} };</script>

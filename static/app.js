@@ -40,6 +40,18 @@ async function fetchDemoRemote() {
   return data.channels;
 }
 
+// LLM 추천 호출 (Upstage Solar)
+async function fetchRecommendationsRemote(channels) {
+  const res = await fetch(`${API_BASE}/api/recommend`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channels }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `추천 서버 오류 (${res.status})`);
+  return data.recommendations || [];
+}
+
 // ──────────────────────────────────────────
 // OAuth 2.0 (Google Identity Services)
 // ──────────────────────────────────────────
@@ -427,8 +439,154 @@ function showResults(channels) {
   renderSummary(channels);
   renderFilterBar(channels);
   renderList(channels);
+  resetRecommendations();
   document.getElementById('results').classList.add('active');
+  document.getElementById('recommendFab').classList.add('visible');
+  startFabInertia();
   document.getElementById('results').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+// ──────────────────────────────────────────
+// 플로팅 추천 버튼 - 부드러운 관성 따라오기
+//   target = 스크롤이 멈춘 최종 위치(원래 fixed 자리)
+//   current = 실제 그려지는 위치 (lerp로 천천히 수렴)
+//   둘의 차이를 translateY로 표현 → 스크롤 중엔 살짝 뒤따라오고, 멈추면 부드럽게 정착
+// ──────────────────────────────────────────
+let fabInertiaStarted = false;
+function startFabInertia() {
+  if (fabInertiaStarted) return;
+  fabInertiaStarted = true;
+  const fab = document.getElementById('recommendFab');
+  let targetY = window.scrollY;
+  let currentY = targetY;
+  window.addEventListener('scroll', () => { targetY = window.scrollY; }, { passive: true });
+  function tick() {
+    // 0.12 = 관성 강도 (작을수록 더 느리고 부드럽게 따라옴)
+    currentY += (targetY - currentY) * 0.12;
+    const lag = targetY - currentY;
+    // 스크롤 방향과 반대로 살짝 끌리는 효과 + 한도 제한(±28px)
+    const offset = Math.max(-28, Math.min(28, lag));
+    fab.style.transform = `translateY(${offset}px)`;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+// ──────────────────────────────────────────
+// LLM 추천 (Upstage Solar)
+// ──────────────────────────────────────────
+function resetRecommendations() {
+  document.getElementById('recommendList').innerHTML = '';
+  document.getElementById('recommendError').style.display = 'none';
+  document.getElementById('recommendLoading').style.display = 'none';
+  const fab = document.getElementById('recommendFab');
+  fab.disabled = false;
+  fab.querySelector('.recommend-fab-label').textContent = 'AI 추천';
+}
+
+async function requestRecommendations() {
+  if (!allChannels.length) return;
+  const fab = document.getElementById('recommendFab');
+  const fabLabel = fab.querySelector('.recommend-fab-label');
+  const loading = document.getElementById('recommendLoading');
+  const errBox = document.getElementById('recommendError');
+  const list = document.getElementById('recommendList');
+
+  fab.disabled = true;
+  fabLabel.textContent = '생성 중';
+  loading.style.display = 'flex';
+  errBox.style.display = 'none';
+  list.innerHTML = '';
+
+  // 추천 섹션으로 부드럽게 스크롤
+  document.getElementById('recommendSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  try {
+    let recs = await fetchRecommendationsRemote(allChannels);
+    // 1차 렌더(이니셜 + 검색 링크) → 사용자가 결과를 바로 볼 수 있게
+    renderRecommendations(recs);
+    // 백그라운드로 YouTube search 호출해서 썸네일/채널 URL 채워 넣기
+    recs = await enrichRecommendations(recs);
+    renderRecommendations(recs);
+    fabLabel.textContent = '다시 추천';
+  } catch (e) {
+    errBox.textContent = '⚠️ ' + e.message;
+    errBox.style.display = 'block';
+    fabLabel.textContent = '다시 시도';
+  } finally {
+    fab.disabled = false;
+    loading.style.display = 'none';
+  }
+}
+
+// LLM 추천 결과에 YouTube 실제 채널 정보(썸네일, channelId)를 덧붙인다.
+// accessToken이 없으면(데모 모드 등) 원본 그대로 반환.
+async function enrichRecommendations(recs) {
+  if (!accessToken || !recs?.length) return recs;
+  const BASE = 'https://www.googleapis.com/youtube/v3';
+  const headers = { Authorization: 'Bearer ' + accessToken };
+  return Promise.all(recs.map(async (r) => {
+    if (!r?.name) return r;
+    try {
+      const url = `${BASE}/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(r.name)}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) return r;
+      const data = await res.json();
+      const item = data.items?.[0];
+      if (!item) return r;
+      return {
+        ...r,
+        channelId: item.id?.channelId || null,
+        thumbnail: item.snippet?.thumbnails?.default?.url || null,
+        actualName: item.snippet?.title || r.name,
+      };
+    } catch {
+      return r;
+    }
+  }));
+}
+
+function renderRecommendations(recs) {
+  const list = document.getElementById('recommendList');
+  if (!recs || !recs.length) {
+    list.innerHTML = `<div class="recommend-empty">추천 결과가 없습니다.</div>`;
+    return;
+  }
+  list.innerHTML = recs.map((r) => {
+    const displayName = escapeHtml(r.actualName || r.name || '이름 없음');
+    const category = escapeHtml(r.category || '');
+    const reason = escapeHtml(r.reason || '');
+    const initial = escapeHtml((r.actualName || r.name || '?').trim().charAt(0).toUpperCase());
+
+    // channelId 있으면 채널로 바로 이동, 없으면 검색 결과로 폴백
+    const linkUrl = r.channelId
+      ? `https://www.youtube.com/channel/${encodeURIComponent(r.channelId)}`
+      : `https://www.youtube.com/results?search_query=${encodeURIComponent(r.name || '')}`;
+    const linkLabel = r.channelId ? '채널로 이동 →' : '유튜브에서 찾기 →';
+
+    const thumbHtml = r.thumbnail
+      ? `<img class="recommend-thumb" src="${escapeHtml(r.thumbnail)}" alt="${displayName}" loading="lazy"
+            onerror="this.outerHTML='<div class=&quot;recommend-thumb recommend-thumb-fallback&quot;>${initial}</div>'"/>`
+      : `<div class="recommend-thumb recommend-thumb-fallback">${initial}</div>`;
+
+    return `
+      <div class="recommend-card">
+        ${thumbHtml}
+        <div class="recommend-body">
+          <div class="recommend-name">${displayName}</div>
+          ${category ? `<div class="recommend-cat">${category}</div>` : ''}
+          <div class="recommend-reason">${reason}</div>
+        </div>
+        <a class="recommend-link" href="${linkUrl}" target="_blank" rel="noopener">${linkLabel}</a>
+      </div>
+    `;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[m]));
 }
 
 function renderSummary(channels) {
@@ -716,3 +874,22 @@ function showError(msg) { const e=document.getElementById('errorBox'); e.textCon
 function hideError() { document.getElementById('errorBox').classList.remove('active'); }
 function showGuide() { document.getElementById('modal').classList.add('active'); }
 function closeModal() { document.getElementById('modal').classList.remove('active'); }
+
+// 발급 가이드의 도메인 칩 클릭 → 클립보드 복사 + 시각 피드백
+async function copyOrigin(el) {
+  const text = (el?.textContent || '').trim();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // 권한 거부/비-HTTPS 폴백: 선택 표시만
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+  }
+  const orig = el.textContent;
+  el.classList.add('copied');
+  el.textContent = '✓ 복사됨';
+  setTimeout(() => { el.classList.remove('copied'); el.textContent = orig; }, 1200);
+}
