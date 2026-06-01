@@ -155,6 +155,12 @@ Flask는 `static_folder="static"` + `template_folder="static"` 으로 동일 폴
 | GET | `/` | 메인 SPA (`youtube-analyzer.html`, `client_id` 인라인 주입) |
 | POST | `/api/analyze` | 채널 배열을 받아 점수·정렬·그룹 분류 |
 | GET | `/api/demo` | 15개 샘플 채널로 동일 파이프라인 시연 |
+| POST | `/api/recommend` | (LLM) 최애·자주 보는 채널 기반 새 채널 10개 추천 |
+| POST | `/api/verify_recommend` | (LLM) 추천 채널의 **실제 설명**으로 분류·사유를 교정하고 취향 부적합 제외 |
+| POST | `/api/persona` | (LLM) 점수·카테고리 분포를 시청 취향 페르소나 리포트로 해석 |
+| POST | `/api/cleanup` | (LLM) 점수 20 미만 휴면·저관심 채널의 정리 여부 제안 |
+
+> `/api/recommend·persona·cleanup` 은 Upstage Solar(`solar-pro2`)를 호출하므로 `.env` 의 `UPSTAGE_API_KEY` 가 필요합니다. 분석 결과 화면의 **🤖 AI 분석 도구** 섹션(또는 우하단 플로팅 버튼)에서 세 모드를 선택해 사용합니다.
 
 POST 요청 본문 예:
 ```json

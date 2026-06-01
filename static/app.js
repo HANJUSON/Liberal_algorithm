@@ -40,16 +40,40 @@ async function fetchDemoRemote() {
   return data.channels;
 }
 
-// LLM 추천 호출 (Upstage Solar)
-async function fetchRecommendationsRemote(channels) {
+// LLM 추천 호출 (Upstage Solar). count=요청 개수, exclude=제외할 채널명 배열
+async function fetchRecommendationsRemote(channels, count = 10, exclude = []) {
   const res = await fetch(`${API_BASE}/api/recommend`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channels, count, exclude }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `추천 서버 오류 (${res.status})`);
+  return data.recommendations || [];
+}
+
+// LLM 시청 취향 페르소나 호출 (Upstage Solar)
+async function fetchPersonaRemote(channels) {
+  const res = await fetch(`${API_BASE}/api/persona`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channels }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `추천 서버 오류 (${res.status})`);
-  return data.recommendations || [];
+  if (!res.ok) throw new Error(data.error || `페르소나 서버 오류 (${res.status})`);
+  return data.persona;
+}
+
+// LLM 구독 정리 코치 호출 (Upstage Solar)
+async function fetchCleanupRemote(channels) {
+  const res = await fetch(`${API_BASE}/api/cleanup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channels }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `정리 코치 서버 오류 (${res.status})`);
+  return data; // { summary, items }
 }
 
 // ──────────────────────────────────────────
@@ -225,6 +249,8 @@ async function fetchYouTubeData() {
         comments: 0,
         likes: 0,
         category: '채널',
+        // 채널 설명 일부 → LLM이 채널 성격을 추측(환각)하지 않도록 근거 제공
+        description: (item.snippet.description || '').slice(0, 200),
       });
     }
     pageToken = data.nextPageToken || '';
@@ -278,14 +304,17 @@ async function fetchYouTubeData() {
         ch.watchCount = w.count;
         if (w.lastDate) {
           ch.lastWatchDays = Math.max(0, Math.floor((todayMs - w.lastDate.getTime()) / 86400000));
+          ch.lastWatchEstimated = false; // 실제 시청 타임스탬프에서 측정
         } else {
           // HTML 포맷 → 시각 미상. 구독 기간만큼 dormant 보수적 추정
           ch.lastWatchDays = (ch.subMonths || 0) * 30;
+          ch.lastWatchEstimated = true;
         }
       } else {
-        // Takeout이 있는데 이 채널은 시청 0건 → 구독 전체 기간 휴면
+        // Takeout이 있는데 이 채널은 시청 0건 → 구독 전체 기간 휴면(추정)
         ch.watchCount = 0;
         ch.lastWatchDays = (ch.subMonths || 0) * 30;
+        ch.lastWatchEstimated = true;
       }
     }
   }
@@ -439,7 +468,7 @@ function showResults(channels) {
   renderSummary(channels);
   renderFilterBar(channels);
   renderList(channels);
-  resetRecommendations();
+  resetAiSection();
   document.getElementById('results').classList.add('active');
   document.getElementById('recommendFab').classList.add('visible');
   startFabInertia();
@@ -473,86 +502,398 @@ function startFabInertia() {
 }
 
 // ──────────────────────────────────────────
-// LLM 추천 (Upstage Solar)
+// AI 분석 도구 (Solar LLM): 페르소나 / 구독 정리 / 채널 추천
 // ──────────────────────────────────────────
-function resetRecommendations() {
-  document.getElementById('recommendList').innerHTML = '';
-  document.getElementById('recommendError').style.display = 'none';
-  document.getElementById('recommendLoading').style.display = 'none';
+let currentAiMode = null;
+
+function resetAiSection() {
+  currentAiMode = null;
+  document.getElementById('aiOutput').innerHTML = '';
+  document.getElementById('aiError').style.display = 'none';
+  document.getElementById('aiLoading').style.display = 'none';
+  document.querySelectorAll('.ai-mode-card').forEach(c => c.classList.remove('active'));
   const fab = document.getElementById('recommendFab');
-  fab.disabled = false;
-  fab.querySelector('.recommend-fab-label').textContent = 'AI 추천';
+  if (fab) fab.disabled = false;
 }
 
-async function requestRecommendations() {
+// FAB 클릭: AI 섹션으로 스크롤. 모드 미선택 상태면 카드들을 잠깐 강조.
+function scrollToAiSection() {
+  document.getElementById('aiSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (!currentAiMode) {
+    const grid = document.getElementById('aiModeGrid');
+    grid.classList.remove('pulse');
+    void grid.offsetWidth; // reflow → 애니메이션 재시작
+    grid.classList.add('pulse');
+  }
+}
+
+// 모드 선택 → 해당 분석 실행
+function selectAiMode(mode) {
   if (!allChannels.length) return;
-  const fab = document.getElementById('recommendFab');
-  const fabLabel = fab.querySelector('.recommend-fab-label');
-  const loading = document.getElementById('recommendLoading');
-  const errBox = document.getElementById('recommendError');
-  const list = document.getElementById('recommendList');
+  currentAiMode = mode;
+  document.querySelectorAll('.ai-mode-card').forEach(c => {
+    c.classList.toggle('active', c.dataset.mode === mode);
+  });
+  if (mode === 'persona') return runPersona();
+  if (mode === 'cleanup') return runCleanup();
+  if (mode === 'recommend') return runRecommend();
+}
 
-  fab.disabled = true;
-  fabLabel.textContent = '생성 중';
-  loading.style.display = 'flex';
-  errBox.style.display = 'none';
-  list.innerHTML = '';
+// 공통 출력 영역 제어 헬퍼
+function aiStart(loadingText) {
+  document.getElementById('recommendFab').disabled = true;
+  document.getElementById('aiLoadingText').textContent = loadingText;
+  document.getElementById('aiLoading').style.display = 'flex';
+  document.getElementById('aiError').style.display = 'none';
+  document.getElementById('aiOutput').innerHTML = '';
+  document.getElementById('aiSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function aiEnd() {
+  document.getElementById('recommendFab').disabled = false;
+  document.getElementById('aiLoading').style.display = 'none';
+}
+function showAiError(msg) {
+  const e = document.getElementById('aiError');
+  e.textContent = '⚠️ ' + msg;
+  e.style.display = 'block';
+}
 
-  // 추천 섹션으로 부드럽게 스크롤
-  document.getElementById('recommendSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+const RECOMMEND_TARGET = 10; // 최종 확정 추천 개수
 
+// 신규 추천을 확정 목록(confirmed)에 중복 없이 병합. limit 도달 시 멈춘다.
+// 기준: 이미 구독 중인 channelId, confirmed의 channelId, 정규화된 이름.
+function mergeRecommendations(confirmed, incoming, limit) {
+  const subscribedIds = new Set(allChannels.map(c => c.id).filter(Boolean));
+  const norm = r => (r.actualName || r.name || '').trim().toLowerCase().replace(/\s+/g, '');
+  const ids = new Set(confirmed.map(r => r.channelId).filter(Boolean));
+  const names = new Set(confirmed.map(norm).filter(Boolean));
+  for (const r of incoming) {
+    if (confirmed.length >= limit) break;
+    if (!r) continue;
+    const id = r.channelId || null;
+    if (id && subscribedIds.has(id)) continue;
+    if (id && ids.has(id)) continue;
+    const key = norm(r);
+    if (key && names.has(key)) continue;
+    if (id) ids.add(id);
+    if (key) names.add(key);
+    confirmed.push(r);
+  }
+  return confirmed;
+}
+
+async function runRecommend() {
+  aiStart('Solar LLM이 새 채널을 추천하는 중... (10~20초)');
   try {
-    let recs = await fetchRecommendationsRemote(allChannels);
-    // 1차 렌더(이니셜 + 검색 링크) → 사용자가 결과를 바로 볼 수 있게
-    renderRecommendations(recs);
-    // 백그라운드로 YouTube search 호출해서 썸네일/채널 URL 채워 넣기
-    recs = await enrichRecommendations(recs);
-    renderRecommendations(recs);
-    fabLabel.textContent = '다시 추천';
+    const confirmed = [];          // 검증을 통과한 최종 추천 (최대 RECOMMEND_TARGET)
+    const excludeNames = new Set(); // 이미 추천/거부된 이름 → 다음 라운드 제외
+    const MAX_ROUNDS = 3;          // 보충 라운드 상한 (무한루프 방지)
+
+    for (let round = 0; round < MAX_ROUNDS && confirmed.length < RECOMMEND_TARGET; round++) {
+      const need = RECOMMEND_TARGET - confirmed.length;
+      // 검증·중복으로 줄어드는 걸 감안해 넉넉히 요청
+      const askCount = round === 0 ? RECOMMEND_TARGET + 5 : need + 4;
+
+      let recs = await fetchRecommendationsRemote(allChannels, askCount, [...excludeNames]);
+      recs.forEach(r => { if (r?.name) excludeNames.add(r.name); });
+      recs = dedupeRecommendations(recs);
+
+      // 첫 라운드는 빠른 1차 렌더(미검증, 검색 링크) → 사용자가 바로 볼 수 있게
+      if (round === 0) {
+        renderRecommendations(mergeRecommendations([], recs, RECOMMEND_TARGET));
+      }
+
+      // 실제 YouTube 채널로 해석 → channelId + 실제 설명/영상 제목/썸네일
+      document.getElementById('aiLoadingText').textContent = '실제 YouTube 채널 정보를 확인하는 중...';
+      recs = await enrichRecommendations(recs);
+      recs = dedupeRecommendations(recs);
+      recs.forEach(r => { if (r?.actualName) excludeNames.add(r.actualName); }); // 실제 이름도 누적 제외
+
+      // 실제 설명·영상으로 분류·사유 재검증 (오분류 교정 + 취향 부적합 제외)
+      document.getElementById('aiLoadingText').textContent =
+        round === 0 ? '실제 설명·영상으로 추천 분류를 검증하는 중...'
+                    : `추천을 ${RECOMMEND_TARGET}개로 채우는 중... (보충 ${round}차)`;
+      recs = await verifyRecommendations(recs);
+
+      mergeRecommendations(confirmed, recs, RECOMMEND_TARGET);
+      renderRecommendations(confirmed);
+    }
+
+    if (confirmed.length < RECOMMEND_TARGET) {
+      // 취향 폭이 좁아 더 못 채운 경우: 가진 만큼만 노출 (best-effort)
+      renderRecommendations(confirmed);
+    }
   } catch (e) {
-    errBox.textContent = '⚠️ ' + e.message;
-    errBox.style.display = 'block';
-    fabLabel.textContent = '다시 시도';
+    showAiError(e.message);
   } finally {
-    fab.disabled = false;
-    loading.style.display = 'none';
+    aiEnd();
+  }
+}
+
+// 상위 채널(점수 50+, 최대 topN)에 최근 영상 제목을 첨부한 채널 배열을 반환.
+// 로그인 상태에서만 동작하며, 실패 시 원본을 그대로 돌려준다.
+async function attachVideoTitles(channels, topN = 15) {
+  if (!accessToken) return channels;
+  const top = channels.filter(c => (c.score || 0) >= 50).slice(0, topN);
+  const ids = top.map(c => c.id).filter(Boolean);
+  if (!ids.length) return channels;
+  const headers = { Authorization: 'Bearer ' + accessToken };
+  let titlesById = {};
+  try {
+    titlesById = await fetchRecentVideoTitles(ids, headers, 6);
+  } catch {
+    return channels;
+  }
+  return channels.map(c => (titlesById[c.id] ? { ...c, videoTitles: titlesById[c.id] } : c));
+}
+
+async function runPersona() {
+  aiStart('Solar LLM이 취향 페르소나를 분석하는 중... (10~20초)');
+  try {
+    let channels = allChannels;
+    // 상위 채널의 최근 영상 제목을 근거로 첨부 (로그인 상태에서만)
+    if (accessToken) {
+      document.getElementById('aiLoadingText').textContent = '상위 채널의 최근 영상을 살펴보는 중...';
+      channels = await attachVideoTitles(allChannels);
+      document.getElementById('aiLoadingText').textContent = 'Solar LLM이 취향 페르소나를 분석하는 중... (10~20초)';
+    }
+    const persona = await fetchPersonaRemote(channels);
+    renderPersona(persona);
+  } catch (e) {
+    showAiError(e.message);
+  } finally {
+    aiEnd();
+  }
+}
+
+async function runCleanup() {
+  aiStart('Solar LLM이 구독 정리를 분석하는 중... (10~20초)');
+  try {
+    const data = await fetchCleanupRemote(allChannels);
+    renderCleanup(data);
+  } catch (e) {
+    showAiError(e.message);
+  } finally {
+    aiEnd();
   }
 }
 
 // LLM 추천 결과에 YouTube 실제 채널 정보(썸네일, channelId)를 덧붙인다.
 // accessToken이 없으면(데모 모드 등) 원본 그대로 반환.
+// 2단계 해석: ① 채널 직접 검색 → ② (실패 시) 영상 검색 후 그 영상의 채널로 폴백.
+// 이렇게 하면 사실상 모든 추천이 channelId를 얻어 "채널로 바로 이동" 링크가 된다.
+async function resolveRecommendChannel(name, headers) {
+  const BASE = 'https://www.googleapis.com/youtube/v3';
+  // ① 채널 검색
+  try {
+    const url = `${BASE}/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(name)}`;
+    const res = await fetch(url, { headers });
+    if (res.ok) {
+      const item = (await res.json()).items?.[0];
+      if (item?.id?.channelId) {
+        return {
+          channelId: item.id.channelId,
+          thumbnail: item.snippet?.thumbnails?.default?.url || null,
+          actualName: item.snippet?.title || name,
+        };
+      }
+    }
+  } catch { /* 폴백으로 진행 */ }
+  // ② 영상 검색 → 해당 영상의 채널 (채널 검색이 비는 이름 보강). 썸네일은 영상 것이라 생략.
+  try {
+    const url = `${BASE}/search?part=snippet&type=video&maxResults=1&q=${encodeURIComponent(name)}`;
+    const res = await fetch(url, { headers });
+    if (res.ok) {
+      const item = (await res.json()).items?.[0];
+      if (item?.snippet?.channelId) {
+        return {
+          channelId: item.snippet.channelId,
+          thumbnail: null,
+          actualName: item.snippet?.channelTitle || name,
+        };
+      }
+    }
+  } catch { /* 해석 실패 → 원본 유지 */ }
+  return null;
+}
+
+// channelId 배치 → 실제 제목/설명/썸네일 (channels.list, 50개당 1 unit으로 저렴)
+async function fetchChannelMeta(ids, headers) {
+  const BASE = 'https://www.googleapis.com/youtube/v3';
+  const out = {};
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    try {
+      const url = `${BASE}/channels?part=snippet&id=${batch.join(',')}&maxResults=50`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const item of (data.items || [])) {
+        out[item.id] = {
+          title: item.snippet?.title || '',
+          description: (item.snippet?.description || '').slice(0, 300),
+          thumbnail: item.snippet?.thumbnails?.default?.url || null,
+        };
+      }
+    } catch { /* 배치 실패는 무시 */ }
+  }
+  return out;
+}
+
+// channelId 배치 → 최근 영상 제목. 검색(100 units) 대신 업로드 재생목록 경유로 채널당 ~2 units.
+//   ① channels.list?contentDetails 로 '업로드 재생목록' ID 확보 (50개당 1 unit)
+//   ② playlistItems.list 로 최근 영상 제목 수집 (재생목록당 1 unit)
+async function fetchRecentVideoTitles(ids, headers, perChannel = 8) {
+  const BASE = 'https://www.googleapis.com/youtube/v3';
+  const out = {}; // { channelId: [title, ...] }
+  const uploads = {}; // channelId → uploadsPlaylistId
+
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    try {
+      const url = `${BASE}/channels?part=contentDetails&id=${batch.join(',')}&maxResults=50`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const item of (data.items || [])) {
+        const pl = item.contentDetails?.relatedPlaylists?.uploads;
+        if (pl) uploads[item.id] = pl;
+      }
+    } catch { /* 배치 실패는 무시 */ }
+  }
+
+  const entries = Object.entries(uploads);
+  const BATCH = 10; // 동시 호출 제한
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const slice = entries.slice(i, i + BATCH);
+    await Promise.all(slice.map(async ([cid, pl]) => {
+      try {
+        const url = `${BASE}/playlistItems?part=snippet&playlistId=${pl}&maxResults=${perChannel}`;
+        const res = await fetch(url, { headers });
+        if (!res.ok) return;
+        const data = await res.json();
+        const titles = (data.items || [])
+          .map(it => it.snippet?.title)
+          .filter(t => t && t !== 'Private video' && t !== 'Deleted video');
+        if (titles.length) out[cid] = titles;
+      } catch { /* 채널 단위 실패는 무시 */ }
+    }));
+  }
+  return out;
+}
+
 async function enrichRecommendations(recs) {
   if (!accessToken || !recs?.length) return recs;
-  const BASE = 'https://www.googleapis.com/youtube/v3';
   const headers = { Authorization: 'Bearer ' + accessToken };
-  return Promise.all(recs.map(async (r) => {
+  // 1) 추천 이름 → 실제 channelId 해석
+  const resolved = await Promise.all(recs.map(async (r) => {
     if (!r?.name) return r;
-    try {
-      const url = `${BASE}/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(r.name)}`;
-      const res = await fetch(url, { headers });
-      if (!res.ok) return r;
-      const data = await res.json();
-      const item = data.items?.[0];
-      if (!item) return r;
-      return {
-        ...r,
-        channelId: item.id?.channelId || null,
-        thumbnail: item.snippet?.thumbnails?.default?.url || null,
-        actualName: item.snippet?.title || r.name,
-      };
-    } catch {
-      return r;
-    }
+    const hit = await resolveRecommendChannel(r.name, headers);
+    return hit ? { ...r, ...hit } : r;
   }));
+  // 2) 해석된 채널의 '실제 설명/제목/썸네일' + '최근 영상 제목'을 확보 (검증·표시의 근거)
+  const ids = resolved.map(r => r.channelId).filter(Boolean);
+  if (ids.length) {
+    const meta = await fetchChannelMeta(ids, headers);
+    const titles = await fetchRecentVideoTitles(ids, headers, 8);
+    for (const r of resolved) {
+      const m = r.channelId && meta[r.channelId];
+      if (m) {
+        r.actualName = m.title || r.actualName || r.name;
+        r.realDescription = m.description || '';
+        if (m.thumbnail) r.thumbnail = m.thumbnail;
+      }
+      if (r.channelId && titles[r.channelId]) r.realVideoTitles = titles[r.channelId];
+    }
+  }
+  return resolved;
+}
+
+// 추천 중복 제거: ① 이미 구독 중인 채널(channelId) 제외, ② channelId 중복 제거,
+// ③ 정규화된 이름 중복 제거(channelId 미해석분 보강). 먼저 등장한 항목을 유지한다.
+function dedupeRecommendations(recs) {
+  const subscribedIds = new Set(allChannels.map(c => c.id).filter(Boolean));
+  const seenIds = new Set();
+  const seenNames = new Set();
+  const out = [];
+  for (const r of recs) {
+    if (!r) continue;
+    const id = r.channelId || null;
+    if (id && subscribedIds.has(id)) continue;           // 이미 구독 중 → 제외
+    if (id) {
+      if (seenIds.has(id)) continue;                     // 같은 채널 중복 → 제외
+      seenIds.add(id);
+    }
+    const nameKey = (r.actualName || r.name || '').trim().toLowerCase().replace(/\s+/g, '');
+    if (nameKey) {
+      if (seenNames.has(nameKey)) continue;              // 같은 이름 중복 → 제외
+      seenNames.add(nameKey);
+    }
+    out.push(r);
+  }
+  return out;
+}
+
+// 추천 검증 호출 (실제 설명 기반 분류·사유 교정)
+async function fetchVerifyRemote(candidates, interests) {
+  const res = await fetch(`${API_BASE}/api/verify_recommend`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ candidates, interests }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `검증 서버 오류 (${res.status})`);
+  return data.results || [];
+}
+
+// 실제 설명이 확보된 추천을 재검증: 카테고리/사유를 실제 설명에 맞게 교정하고,
+// 취향과 명백히 안 맞는 추천(fit=false)은 제외한다. 실패 시 원본을 그대로 유지(안전).
+async function verifyRecommendations(recs) {
+  // 실제 설명 또는 최근 영상 제목이 확보된 추천만 검증 가능
+  const verifiable = recs.filter(r => r.realDescription || (r.realVideoTitles && r.realVideoTitles.length));
+  if (!verifiable.length) return recs;
+
+  // 사용자 취향 컨텍스트: 상위 채널 이름 + 설명
+  const interests = allChannels
+    .filter(c => (c.score || 0) >= 50)
+    .slice(0, 15)
+    .map(c => ({ name: c.name, description: (c.description || '').slice(0, 200) }));
+
+  let corrected;
+  try {
+    corrected = await fetchVerifyRemote(
+      verifiable.map(r => ({
+        name: r.actualName || r.name,
+        description: r.realDescription || '',
+        videoTitles: r.realVideoTitles || [],
+      })),
+      interests,
+    );
+  } catch {
+    return recs; // 검증 실패 시 원본 유지
+  }
+
+  const byName = {};
+  for (const c of corrected) byName[c.name] = c;
+
+  const result = [];
+  for (const r of recs) {
+    const c = byName[r.actualName || r.name];
+    if (!c) { result.push(r); continue; }          // 검증 결과 없으면 원본 유지
+    if (c.fit === false) continue;                  // 취향과 명백히 불일치 → 제외
+    result.push({ ...r, category: c.category || r.category, reason: c.reason || r.reason });
+  }
+  // 전부 걸러졌다면(과도한 제외) 원본 유지로 폴백
+  return result.length ? result : recs;
 }
 
 function renderRecommendations(recs) {
-  const list = document.getElementById('recommendList');
+  const out = document.getElementById('aiOutput');
   if (!recs || !recs.length) {
-    list.innerHTML = `<div class="recommend-empty">추천 결과가 없습니다.</div>`;
+    out.innerHTML = `<div class="recommend-empty">추천 결과가 없습니다.</div>`;
     return;
   }
-  list.innerHTML = recs.map((r) => {
+  const cards = recs.map((r) => {
     const displayName = escapeHtml(r.actualName || r.name || '이름 없음');
     const category = escapeHtml(r.category || '');
     const reason = escapeHtml(r.reason || '');
@@ -581,6 +922,62 @@ function renderRecommendations(recs) {
       </div>
     `;
   }).join('');
+  out.innerHTML = `<div class="recommend-list">${cards}</div>`;
+}
+
+// 시청 취향 페르소나 렌더
+function renderPersona(p) {
+  const out = document.getElementById('aiOutput');
+  if (!p) {
+    out.innerHTML = `<div class="recommend-empty">페르소나를 생성하지 못했습니다.</div>`;
+    return;
+  }
+  const interests = (p.topInterests || [])
+    .map(i => `<span class="persona-chip">${escapeHtml(i)}</span>`).join('');
+  const traits = (p.traits || []).map(t => `
+    <div class="persona-trait">
+      <div class="persona-trait-label">${escapeHtml(t.label || '')}</div>
+      <div class="persona-trait-desc">${escapeHtml(t.desc || '')}</div>
+    </div>`).join('');
+
+  out.innerHTML = `
+    <div class="persona-card">
+      <div class="persona-head">
+        <div class="persona-emoji">${escapeHtml(p.emoji || '🎭')}</div>
+        <div class="persona-head-text">
+          <div class="persona-title">${escapeHtml(p.title || '나의 시청 페르소나')}</div>
+          ${interests ? `<div class="persona-chips">${interests}</div>` : ''}
+        </div>
+      </div>
+      ${p.summary ? `<p class="persona-summary">${escapeHtml(p.summary)}</p>` : ''}
+      ${traits ? `<div class="persona-traits">${traits}</div>` : ''}
+    </div>`;
+}
+
+// 구독 정리 코치 렌더
+function renderCleanup(data) {
+  const out = document.getElementById('aiOutput');
+  const items = (data && data.items) || [];
+  if (!items.length) {
+    out.innerHTML = `<div class="recommend-empty">정리할 휴면·저관심 채널이 없습니다. 깔끔하네요! ✨</div>`;
+    return;
+  }
+  // action 라벨 → 색상 클래스
+  const actionCls = { '해제 추천': 'cleanup-drop', '보류 권장': 'cleanup-hold', '유지': 'cleanup-keep' };
+  const rows = items.map(it => {
+    const cls = actionCls[it.action] || 'cleanup-hold';
+    return `
+      <div class="cleanup-item ${cls}">
+        <div class="cleanup-item-main">
+          <div class="cleanup-name">${escapeHtml(it.name || '')}</div>
+          <div class="cleanup-reason">${escapeHtml(it.reason || '')}</div>
+        </div>
+        <div class="cleanup-action">${escapeHtml(it.action || '')}</div>
+      </div>`;
+  }).join('');
+  out.innerHTML = `
+    ${data.summary ? `<p class="cleanup-summary">${escapeHtml(data.summary)}</p>` : ''}
+    <div class="cleanup-list">${rows}</div>`;
 }
 
 function escapeHtml(s) {
