@@ -155,12 +155,28 @@ Flask는 `static_folder="static"` + `template_folder="static"` 으로 동일 폴
 | GET | `/` | 메인 SPA (`youtube-analyzer.html`, `client_id` 인라인 주입) |
 | POST | `/api/analyze` | 채널 배열을 받아 점수·정렬·그룹 분류 |
 | GET | `/api/demo` | 15개 샘플 채널로 동일 파이프라인 시연 |
-| POST | `/api/recommend` | (LLM) 최애·자주 보는 채널 기반 새 채널 10개 추천 |
-| POST | `/api/verify_recommend` | (LLM) 추천 채널의 **실제 설명**으로 분류·사유를 교정하고 취향 부적합 제외 |
+| POST | `/api/interest_keywords` | (LLM) 상위 채널·최근 영상 제목 → 새 채널 발굴용 검색 키워드 추출 |
+| POST | `/api/curate` | (LLM) **영상 검색으로 발굴한 실제 채널 풀**에서 취향에 맞는 채널 선별·순위 |
+| POST | `/api/recommend` | (LLM) 채널명 직접 생성 추천 — 발굴 실패/비로그인 시 폴백 경로 |
+| POST | `/api/verify_recommend` | (LLM) 폴백 추천 채널의 **실제 설명·영상 제목**으로 분류·사유 교정 및 취향 부적합 제외 |
 | POST | `/api/persona` | (LLM) 점수·카테고리 분포를 시청 취향 페르소나 리포트로 해석 |
 | POST | `/api/cleanup` | (LLM) 점수 20 미만 휴면·저관심 채널의 정리 여부 제안 |
 
-> `/api/recommend·persona·cleanup` 은 Upstage Solar(`solar-pro2`)를 호출하므로 `.env` 의 `UPSTAGE_API_KEY` 가 필요합니다. 분석 결과 화면의 **🤖 AI 분석 도구** 섹션(또는 우하단 플로팅 버튼)에서 세 모드를 선택해 사용합니다.
+> 위 LLM 엔드포인트는 Upstage Solar(`solar-pro2`)를 호출하므로 `.env` 의 `UPSTAGE_API_KEY` 가 필요합니다. 분석 결과 화면의 **🤖 AI 분석 도구** 섹션(또는 우하단 플로팅 버튼)에서 세 모드를 선택해 사용합니다.
+
+### 새 채널 추천 — 영상 우선 발굴(video-first discovery)
+
+LLM이 채널명을 직접 지어내면 **존재하지 않는 채널(환각)** 이나 **설명과 실제 업로드가 다른 채널**을 추천하는 함정에 빠진다. 그래서 추천은 "채널을 이름으로 찾지 않고, 관심사 영상을 검색해 그 영상을 올린 실제 채널을 역수집"하는 방식으로 동작한다 ([app.js](static/app.js) `runRecommend`).
+
+```
+① 관심사 키워드 추출        /api/interest_keywords  (상위 채널 + 최근 영상 제목)
+② 키워드별 영상 검색         search.list?type=video  → 각 영상의 channelId 수집 (키워드당 100 units)
+③ channelId 빈도 집계        2개 이상 키워드에 등장 = 진짜 그 주제 채널 (기구독 제외)
+④ 후보 프로파일링            channels.list + uploads playlistItems  (전부 1 unit, 실제 설명·영상 제목)
+⑤ LLM 큐레이션              /api/curate  → 실제 정보로 순위·이유·적합성(fit) 판정, 부족 시 빈도순 보강
+```
+
+비싼 `search.list`(100 units)는 ②에서 키워드당 1회만 쓰고(최대 8개=800 units), 깊은 프로파일링(④)은 1 unit짜리 엔드포인트로 처리해 쿼터를 아낀다. 비로그인(데모)이거나 발굴 후보가 빈약하면 LLM이 채널명을 직접 생성하는 폴백 경로(`/api/recommend` → `/api/verify_recommend`)로 전환한다.
 
 POST 요청 본문 예:
 ```json

@@ -52,6 +52,30 @@ async function fetchRecommendationsRemote(channels, count = 10, exclude = []) {
   return data.recommendations || [];
 }
 
+// 관심사 키워드 추출 호출 (영상 우선 발굴용 검색어)
+async function fetchKeywordsRemote(interests) {
+  const res = await fetch(`${API_BASE}/api/interest_keywords`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ interests }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `키워드 서버 오류 (${res.status})`);
+  return data.keywords || [];
+}
+
+// 후보 큐레이션 호출 (발굴된 실제 채널 풀에서 선별·순위)
+async function fetchCurateRemote(candidates, interests, count) {
+  const res = await fetch(`${API_BASE}/api/curate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ candidates, interests, count }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `큐레이션 서버 오류 (${res.status})`);
+  return data.results || [];
+}
+
 // LLM 시청 취향 페르소나 호출 (Upstage Solar)
 async function fetchPersonaRemote(channels) {
   const res = await fetch(`${API_BASE}/api/persona`, {
@@ -582,9 +606,162 @@ function mergeRecommendations(confirmed, incoming, limit) {
   return confirmed;
 }
 
+// ──────────────────────────────────────────
+// 새 채널 추천 — 영상 우선 발굴 (video-first discovery)
+//   ① 관심사 키워드 추출 → ② 키워드로 '영상' 검색 → 그 영상의 채널을 역수집(실존 보장)
+//   → ③ 빈도 집계로 진짜 그 주제 채널만 추림 → ④ 싼 엔드포인트로 프로파일링
+//   → ⑤ LLM은 발굴이 아니라 '큐레이션'만. 채널명 환각·메타데이터 불일치를 원천 차단.
+// ──────────────────────────────────────────
 async function runRecommend() {
-  aiStart('Solar LLM이 새 채널을 추천하는 중... (10~20초)');
+  aiStart('관심사 키워드를 분석하는 중...');
   try {
+    // 비로그인(데모 등)은 영상 검색 토큰이 없으므로 기존 LLM-이름 방식으로 폴백
+    if (!accessToken) { await runRecommendByLLMNames(); return; }
+
+    // ① 관심사 키워드 추출 (상위 채널 + 최근 영상 제목 기반)
+    const keywords = await extractInterestKeywords();
+    if (keywords.length < 2) { await runRecommendByLLMNames(); return; }
+
+    // ②~③ 영상 우선 탐색 → channelId 빈도 집계 → 실제 후보 발굴 (기구독 제외)
+    document.getElementById('aiLoadingText').textContent =
+      `'${keywords.slice(0, 3).join(', ')} …' 주제의 영상을 올리는 채널을 찾는 중...`;
+    let candidates = await discoverCandidatesByVideo(keywords);
+    if (candidates.length < 3) { await runRecommendByLLMNames(); return; } // 발굴 빈약 시 폴백
+
+    // ④ 후보 프로파일링 — 실제 제목/설명/영상 제목 (전부 1유닛짜리 싼 엔드포인트)
+    document.getElementById('aiLoadingText').textContent = '후보 채널의 실제 영상을 확인하는 중...';
+    candidates = await profileCandidates(candidates);
+
+    // ⑤ LLM 큐레이션 — 실제 정보 기반 순위·이유·적합성 (발굴은 안 시킴)
+    document.getElementById('aiLoadingText').textContent = 'Solar LLM이 추천을 선별하는 중... (10~20초)';
+    const curated = await curateCandidates(candidates, RECOMMEND_TARGET);
+    renderRecommendations(curated);
+  } catch (e) {
+    showAiError(e.message);
+  } finally {
+    aiEnd();
+  }
+}
+
+// 관심사 키워드 추출: 상위 채널 + 최근 영상 제목 → LLM 검색 키워드
+async function extractInterestKeywords() {
+  const withTitles = await attachVideoTitles(allChannels, 12);
+  const interests = withTitles
+    .filter(c => (c.score || 0) >= 50)
+    .slice(0, 12)
+    .map(c => ({ name: c.name, videoTitles: (c.videoTitles || []).slice(0, 6) }));
+  if (!interests.length) return [];
+  try {
+    return await fetchKeywordsRemote(interests);
+  } catch {
+    return [];
+  }
+}
+
+// 영상 우선 탐색: 키워드별 영상 검색 → channelId 빈도 집계. 비싼 search(100u)는 키워드당 1회만.
+async function discoverCandidatesByVideo(keywords) {
+  const headers = { Authorization: 'Bearer ' + accessToken };
+  const BASE = 'https://www.googleapis.com/youtube/v3';
+  const subscribed = new Set(allChannels.map(c => c.id).filter(Boolean));
+  const freq = new Map();         // channelId → 등장한 키워드 수
+  const searchTitles = new Map(); // channelId → 검색에서 본 영상 제목 일부
+
+  const KW = keywords.slice(0, 8); // 쿼터 보호: 최대 8개 키워드(=800유닛)
+  for (const kw of KW) {
+    try {
+      const url = `${BASE}/search?part=snippet&type=video&order=relevance&maxResults=50&q=${encodeURIComponent(kw)}`;
+      const res = await fetchWithRetry(url, { headers });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const seenThisKw = new Set(); // 같은 키워드 내 동일 채널 중복 카운트 방지
+      for (const item of (data.items || [])) {
+        const cid = item.snippet?.channelId;
+        if (!cid || subscribed.has(cid)) continue;
+        if (!seenThisKw.has(cid)) { freq.set(cid, (freq.get(cid) || 0) + 1); seenThisKw.add(cid); }
+        const t = item.snippet?.title;
+        if (t) { const arr = searchTitles.get(cid) || []; if (arr.length < 5) { arr.push(t); searchTitles.set(cid, arr); } }
+      }
+    } catch { /* 키워드 단위 실패는 무시 */ }
+  }
+
+  // 2개 이상 키워드에서 등장한 채널을 우선(진짜 그 주제 채널). 부족하면 빈도순으로 보강.
+  const entries = [...freq.entries()].sort((a, b) => b[1] - a[1]);
+  const strong = entries.filter(([, n]) => n >= 2);
+  const pool = (strong.length >= 12 ? strong : entries).slice(0, 30);
+  return pool.map(([cid, n]) => ({ channelId: cid, frequency: n, searchTitles: searchTitles.get(cid) || [] }));
+}
+
+// 후보 프로파일링: 실제 제목/설명/썸네일(channels.list) + 최근 영상 제목(uploads) — 전부 싼 엔드포인트.
+async function profileCandidates(candidates) {
+  const headers = { Authorization: 'Bearer ' + accessToken };
+  const ids = candidates.map(c => c.channelId);
+  const meta = await fetchChannelMeta(ids, headers);
+  const titles = await fetchRecentVideoTitles(ids, headers, 8);
+  return candidates.map(c => {
+    const m = meta[c.channelId] || {};
+    return {
+      ...c,
+      name: m.title || '',
+      actualName: m.title || '',
+      realDescription: m.description || '',
+      thumbnail: m.thumbnail || null,
+      realVideoTitles: (titles[c.channelId] && titles[c.channelId].length) ? titles[c.channelId] : (c.searchTitles || []),
+    };
+  }).filter(c => c.actualName); // 메타 해석 실패분 제외
+}
+
+// LLM 큐레이션: 발굴된 실제 후보 중에서 선별·순위. fit=false 제외, 부족하면 빈도순 보강으로 목표치 채움.
+async function curateCandidates(profiled, count) {
+  const interests = allChannels
+    .filter(c => (c.score || 0) >= 50)
+    .slice(0, 15)
+    .map(c => ({ name: c.name, description: (c.description || '').slice(0, 200) }));
+  const candidates = profiled.map(c => ({
+    name: c.actualName || c.name,
+    description: c.realDescription,
+    videoTitles: c.realVideoTitles,
+    frequency: c.frequency,
+  }));
+
+  let results;
+  try {
+    results = await fetchCurateRemote(candidates, interests, count);
+  } catch {
+    return profiled.slice(0, count); // 큐레이션 실패 → 빈도순 상위로 폴백
+  }
+
+  const byName = {};
+  profiled.forEach(p => { byName[p.actualName || p.name] = p; });
+  const rejected = new Set(results.filter(r => r.fit === false).map(r => r.name));
+
+  const out = [];
+  const chosen = new Set();
+  for (const r of results) {
+    if (out.length >= count) break;
+    if (r.fit === false) continue;
+    const p = byName[r.name];
+    if (!p || chosen.has(p.channelId)) continue;
+    chosen.add(p.channelId);
+    out.push({ ...p, category: r.category || '', reason: r.reason || '' });
+  }
+  // 목표치 미달이면 빈도순 후보로 보강 (LLM이 부적합 판정한 것은 제외)
+  if (out.length < count) {
+    const rest = profiled
+      .filter(p => !chosen.has(p.channelId) && !rejected.has(p.actualName || p.name))
+      .sort((a, b) => (b.frequency || 0) - (a.frequency || 0));
+    for (const p of rest) {
+      if (out.length >= count) break;
+      chosen.add(p.channelId);
+      out.push({ ...p, category: p.category || '', reason: p.reason || '관심사 키워드에서 반복 등장한 채널' });
+    }
+  }
+  return out;
+}
+
+// 폴백: 기존 LLM-이름 생성 → 해석 → 검증 방식 (비로그인/발굴 빈약 시)
+async function runRecommendByLLMNames() {
+  document.getElementById('aiLoadingText').textContent = 'Solar LLM이 새 채널을 추천하는 중... (10~20초)';
+  {
     const confirmed = [];          // 검증을 통과한 최종 추천 (최대 RECOMMEND_TARGET)
     const excludeNames = new Set(); // 이미 추천/거부된 이름 → 다음 라운드 제외
     const MAX_ROUNDS = 3;          // 보충 라운드 상한 (무한루프 방지)
@@ -623,11 +800,8 @@ async function runRecommend() {
       // 취향 폭이 좁아 더 못 채운 경우: 가진 만큼만 노출 (best-effort)
       renderRecommendations(confirmed);
     }
-  } catch (e) {
-    showAiError(e.message);
-  } finally {
-    aiEnd();
   }
+  // 예외는 호출부(runRecommend)의 try/catch/finally가 처리한다 (aiEnd 중복 방지)
 }
 
 // 상위 채널(점수 50+, 최대 topN)에 최근 영상 제목을 첨부한 채널 배열을 반환.

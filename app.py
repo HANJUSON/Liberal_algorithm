@@ -442,6 +442,140 @@ def api_verify_recommend():
 
 
 # ──────────────────────────────────────────
+# LLM 관심사 키워드 추출 (영상 우선 발굴용 검색어 생성)
+#   사용자의 상위 채널 + 최근 영상 제목 → 새 채널을 찾기 위한 YouTube 검색 키워드.
+#   "채널을 이름으로 찾지 말고 관심사 영상을 검색"하기 위한 1단계.
+# ──────────────────────────────────────────
+KEYWORDS_SYSTEM_PROMPT = """당신은 YouTube 검색 전략가입니다.
+사용자가 좋아하는 채널과 그 채널들의 최근 영상 제목을 받아, 사용자의 관심사를 대표하는 'YouTube 검색 키워드'를 만듭니다.
+이 키워드로 영상을 검색해 사용자가 좋아할 만한 새 채널을 발굴합니다.
+
+규칙:
+1. 키워드는 8~12개. 실제 YouTube 검색에 바로 쓸 수 있는 자연스러운 한국어 검색어로.
+2. 너무 일반적인 단어(예: "영상", "유튜브")는 피하고, 구체적 주제·장르로.
+3. 사용자의 여러 관심사를 골고루 반영하되, 상위 관심사를 더 많이 포함.
+4. 최근 영상 제목에서 드러나는 실제 주제를 우선 활용하세요(채널명만으로 추측 금지).
+5. 반드시 JSON 형식으로만 응답하세요.
+
+응답 형식:
+{ "keywords": ["검색어1", "검색어2"] }"""
+
+
+def build_keywords_user_prompt(interests):
+    lines = []
+    for c in interests:
+        titles = [str(t).strip() for t in (c.get("videoTitles") or []) if str(t).strip()][:6]
+        line = f"- {c.get('name', '')}"
+        if titles:
+            line += f"\n    최근 영상: {' | '.join(titles)}"
+        lines.append(line)
+    return f"""[사용자가 좋아하는 채널과 최근 영상]
+{chr(10).join(lines) if lines else '- (정보 없음)'}
+
+위 취향을 바탕으로, 새 채널을 발굴하기 위한 YouTube 검색 키워드를 만들어주세요."""
+
+
+@app.route("/api/interest_keywords", methods=["POST"])
+def api_interest_keywords():
+    data = request.get_json(silent=True) or {}
+    interests = data.get("interests", [])
+    if not isinstance(interests, list) or not interests:
+        return jsonify({"error": "interests 배열이 비어있습니다."}), 400
+
+    parsed, err = call_solar_json(
+        KEYWORDS_SYSTEM_PROMPT,
+        build_keywords_user_prompt(interests),
+        temperature=0.5,
+    )
+    if err:
+        return jsonify({"error": err}), 502
+    kws = [str(k).strip() for k in (parsed.get("keywords") or []) if str(k).strip()]
+    return jsonify({"keywords": kws[:12]})
+
+
+# ──────────────────────────────────────────
+# LLM 후보 큐레이션 (영상 검색으로 발굴한 실제 채널 풀에서 선별·순위)
+#   후보는 모두 '실제로 존재하며 그 주제 영상을 올린' 채널 → 환각 위험 없음.
+#   LLM은 발굴이 아니라 순위·이유·적합성 판정(큐레이션)만 담당.
+# ──────────────────────────────────────────
+CURATE_SYSTEM_PROMPT = """당신은 YouTube 채널 큐레이터입니다.
+'사용자의 취향 채널'과, 사용자의 관심사 영상을 검색해 발굴한 '실제 후보 채널 목록'(각 채널의 실제 설명·최근 영상 제목·검색 매칭 빈도 포함)을 받습니다.
+이 후보들 중에서 사용자에게 가장 잘 맞는 채널을 골라 순위를 매깁니다.
+
+규칙:
+1. 반드시 주어진 후보 목록 안에서만 고르세요. 목록에 없는 채널을 새로 만들지 마세요.
+2. category와 reason은 후보의 '실제 설명·최근 영상 제목'에만 근거해 작성하세요. 없는 내용을 지어내지 마세요.
+3. '검색 매칭 빈도'가 높을수록 그 주제를 꾸준히 다루는 채널이라는 강한 신호입니다. 순위에 참고하세요.
+4. 후보의 실제 콘텐츠가 사용자 취향과 명백히 동떨어지면 fit=false. 맞으면 fit=true.
+5. reason은 한 줄(40자 내외)로, 사용자의 어떤 취향과 연결되는지 구체적으로.
+6. 가능하면 다양한 주제를 섞되 상위 관심사를 우선하세요. 좋은 순서대로 정렬해 반환하세요.
+7. 반드시 JSON 형식으로만 응답하세요.
+
+응답 형식:
+{
+  "results": [
+    {"name": "후보 채널명", "category": "분류", "reason": "이유", "fit": true}
+  ]
+}"""
+
+
+def build_curate_user_prompt(candidates, interests, count):
+    int_lines = []
+    for c in interests:
+        desc = (c.get("description") or "").strip().replace("\n", " ")
+        if len(desc) > 100:
+            desc = desc[:100] + "…"
+        line = f"- {c.get('name', '')}"
+        if desc:
+            line += f": {desc}"
+        int_lines.append(line)
+
+    cand_lines = []
+    for c in candidates:
+        desc = (c.get("description") or "").strip().replace("\n", " ")
+        if len(desc) > 160:
+            desc = desc[:160] + "…"
+        titles = [str(t).strip() for t in (c.get("videoTitles") or []) if str(t).strip()][:8]
+        block = f"- {c.get('name', '')} (검색 매칭 빈도 {c.get('frequency', 1)})"
+        block += f"\n    실제 설명: {desc or '(설명 없음)'}"
+        if titles:
+            block += f"\n    최근 영상 제목: {' | '.join(titles)}"
+        cand_lines.append(block)
+
+    return f"""[사용자의 취향 채널]
+{chr(10).join(int_lines) if int_lines else '- (정보 없음)'}
+
+[발굴된 실제 후보 채널 — 이 안에서만 선택]
+{chr(10).join(cand_lines)}
+
+위 후보 중에서 사용자에게 가장 잘 맞는 채널 최대 {count}개를 좋은 순서대로 골라주세요."""
+
+
+@app.route("/api/curate", methods=["POST"])
+def api_curate():
+    data = request.get_json(silent=True) or {}
+    candidates = data.get("candidates", [])
+    interests = data.get("interests", [])
+    if not isinstance(candidates, list) or not candidates:
+        return jsonify({"error": "candidates 배열이 비어있습니다."}), 400
+    try:
+        count = max(1, min(20, int(data.get("count", 10))))
+    except (TypeError, ValueError):
+        count = 10
+    if not isinstance(interests, list):
+        interests = []
+
+    parsed, err = call_solar_json(
+        CURATE_SYSTEM_PROMPT,
+        build_curate_user_prompt(candidates, interests, count),
+        temperature=0.4,
+    )
+    if err:
+        return jsonify({"error": err}), 502
+    return jsonify({"results": parsed.get("results", [])})
+
+
+# ──────────────────────────────────────────
 # LLM 시청 취향 페르소나 (Upstage Solar)
 # ──────────────────────────────────────────
 PERSONA_SYSTEM_PROMPT = """당신은 사용자의 YouTube 시청 데이터를 해석하는 취향 분석가입니다.
