@@ -37,6 +37,91 @@ async function analyzeChannelsRemote(channels) {
   return data.channels;
 }
 
+// 2차 분류 패스: '기타'(미분류) 채널은 이름·설명(앞 200자)만으론 신호가 부족하다.
+//   1차 분석에서 미분류로 나온 채널만 골라 최근 영상 제목(채널당 ~1유닛)을 보강 → videoTitles 부착 →
+//   재분석한다. 분류기(classify_channel)가 이름+설명+영상제목을 함께 보므로 태그 누락이 크게 줄고,
+//   카테고리 벡터가 채워져 취향 그래프도 더 잘 생긴다. 비로그인/미분류 없음/수집 실패 시 null(원본 유지).
+async function reclassifyUnclassifiedByTitles(raw, sorted) {
+  if (!accessToken) return null;
+  const RECLASSIFY_CAP = 120; // 쿼터·지연 보호 (영상 제목 수집은 채널당 ~1유닛)
+  const isEtc = c => c.category === '기타' ||
+    !c.categoryScores || Object.keys(c.categoryScores).length === 0;
+  const targets = sorted.filter(isEtc).sort((a, b) => (b.score || 0) - (a.score || 0));
+  const etcIds = targets.map(c => c.id).filter(Boolean).slice(0, RECLASSIFY_CAP);
+  if (!etcIds.length) return null;
+  if (targets.length > RECLASSIFY_CAP) {
+    console.info(`[reclassify] 미분류 ${targets.length}개 중 점수 상위 ${RECLASSIFY_CAP}개만 재분류`);
+  }
+
+  setStepLabel(4, `미분류 채널 ${etcIds.length}개를 영상 제목으로 재분류 중...`);
+  let titles = {};
+  try {
+    titles = await fetchRecentVideoTitles(etcIds, { Authorization: 'Bearer ' + accessToken }, 8);
+  } catch { return null; }
+
+  const byId = {};
+  raw.forEach(c => { if (c.id) byId[c.id] = c; });
+  let attached = 0;
+  for (const id of etcIds) {
+    const t = titles[id];
+    if (t && t.length && byId[id]) { byId[id].videoTitles = t; attached++; }
+  }
+  if (!attached) return null;
+
+  // videoTitles가 채워진 채널들로 재분석 → 분류·정렬·취향 그래프 모두 갱신
+  return await analyzeChannelsRemote(raw);
+}
+
+// LLM 태그 보정: 규칙 기반 분류가 오분류하기 쉬운 채널을 Solar로 재판정해 태그를 교정한다.
+//   결과 화면을 먼저 보여준 뒤 백그라운드로 실행 → 완료되면 태그만 조용히 갱신한다.
+//   (취향 그래프는 서버의 카테고리 벡터 기반이라 이 보정으로는 바뀌지 않음 — 표시 태그만 교정)
+async function verifyTagsByLLM() {
+  if (!accessToken || !allChannels.length) return;
+  const VERIFY_CAP = 40; // 사용자가 주로 보는 상위 채널 우선 (토큰·쿼터 보호)
+  const targets = allChannels
+    .filter(c => c.id && (c.score || 0) > 0)
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, VERIFY_CAP);
+  if (!targets.length) return;
+
+  // LLM 판정 근거 강화: 영상 제목이 없는 채널은 보강 (있으면 그대로 재사용)
+  const missing = targets.filter(c => !(c.videoTitles && c.videoTitles.length)).map(c => c.id);
+  if (missing.length) {
+    try {
+      const titles = await fetchRecentVideoTitles(missing, { Authorization: 'Bearer ' + accessToken }, 8);
+      const idx = {}; allChannels.forEach(c => { if (c.id) idx[c.id] = c; });
+      for (const id of missing) if (titles[id] && idx[id]) idx[id].videoTitles = titles[id];
+    } catch { /* 제목 보강 실패는 무시하고 이름·설명으로 진행 */ }
+  }
+
+  const payload = targets.map(c => ({
+    id: c.id, name: c.name, description: c.description || '',
+    videoTitles: c.videoTitles || [], category: c.category || '기타',
+  }));
+  let items;
+  try {
+    const res = await fetch(`${API_BASE}/api/classify_verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channels: payload }),
+    });
+    if (!res.ok) return;
+    items = (await res.json()).items || [];
+  } catch { return; }
+
+  // 교정 적용: 카테고리가 바뀐 채널만 갱신. 옛 카테고리의 상세(detail)는 무효 → 비워서 카테고리명으로 표시.
+  const idx = {}; allChannels.forEach(c => { if (c.id) idx[c.id] = c; });
+  let changed = 0;
+  for (const it of items) {
+    const c = idx[it.id];
+    if (c && it.category && it.category !== c.category) {
+      c.category = it.category;
+      c.detail = '';
+      changed++;
+    }
+  }
+  if (changed) renderList(allChannels);
+}
+
 async function fetchDemoRemote() {
   const res = await fetch(`${API_BASE}/api/demo`);
   if (!res.ok) throw new Error(`데모 서버 오류 (${res.status})`);
@@ -399,7 +484,12 @@ async function startAnalysis() {
 
     // 4·5. 백엔드: 정규화 + 지수 평활 → 힙 정렬 (단일 호출이므로 시각 단계만 분리)
     stepActive(4);
-    const sorted = await analyzeChannelsRemote(raw);
+    let sorted = await analyzeChannelsRemote(raw);
+
+    // 2차 패스: '기타'로 분류된 채널을 영상 제목으로 재분류 (태그 누락·취향 그래프 누락 완화)
+    const improved = await reclassifyUnclassifiedByTitles(raw, sorted);
+    if (improved) sorted = improved;
+
     stepDone(4);
     stepActive(5);
     stepDone(5);
@@ -407,6 +497,9 @@ async function startAnalysis() {
     document.getElementById('loading').classList.remove('active');
     setProgress(4);
     showResults(sorted);
+
+    // 결과를 먼저 보여준 뒤, 백그라운드로 LLM 태그 보정 → 완료되면 태그만 조용히 갱신
+    verifyTagsByLLM();
   } catch(e) {
     document.getElementById('loading').classList.remove('active');
     showError('오류: ' + e.message);

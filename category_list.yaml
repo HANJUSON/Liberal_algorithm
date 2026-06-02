@@ -141,6 +141,9 @@ categories:
         - xbox
         - 닌텐도
         - 스위치
+        - 모음집
+        - 공식방송
+        - PV
       general:
         - 플레이
         - 보스
@@ -156,8 +159,11 @@ categories:
         - 발로란트
         - valorant
         - 오버워치
+        - overwatch
         - 마인크래프트
         - minecraft
+        - 롤체
+        - TFT
         - 피파
         - fifa
         - 메이플
@@ -192,11 +198,21 @@ categories:
         - 음원
         - 플레이리스트
         - playlist
+        - 커버
+        - cover
+        - 발성
+        - feat.
+        - MV
+        - 뮤비
+        - Remix
+        - 자막
       general:
         - 멜로디
         - 사운드
         - 작업실
         - 비트메이킹
+        - music
+        - sounds
     케이팝/가수:
       core:
         - 케이팝
@@ -565,6 +581,7 @@ categories:
         - 페인팅
         - 만화그리기
         - 아트워크
+        - 애니메이션
       general:
         - 작품
         - 색칠

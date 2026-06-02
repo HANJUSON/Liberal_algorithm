@@ -215,6 +215,8 @@ def load_category_list(path=CATEGORY_LIST_PATH):
 # 서버 시작 시 1회 로드 (이후 매 분석 요청은 메모리의 컴파일 결과만 사용)
 CATEGORY_LIST = load_category_list()
 CATEGORY_VERSION = CATEGORY_LIST["version"]
+# LLM 태그 보정용 정규 카테고리 이름 목록 (규칙 등장 순서대로 중복 제거)
+CATEGORY_NAMES = list(dict.fromkeys(r[0] for r in CATEGORY_LIST["rules"]))
 logging.getLogger(__name__).info(
     "[classify] 카테고리 목록 v%s 로드 (규칙 %d개)", CATEGORY_VERSION, len(CATEGORY_LIST["rules"])
 )
@@ -1023,6 +1025,65 @@ def api_cleanup():
     if err:
         return jsonify({"error": err}), 502
     return jsonify({"summary": parsed.get("summary", ""), "items": parsed.get("items", [])})
+
+
+# ──────────────────────────────────────────
+# 분류 보정 (LLM): 규칙 기반 분류가 오분류하기 쉬운 채널을, 이름+설명+영상 제목의 실제 의미로
+#   재판정한다. 정해진 카테고리 목록 안에서만 고르게 해 환각을 막는다. (응답은 허용 목록으로 한 번 더 필터)
+# ──────────────────────────────────────────
+CLASSIFY_VERIFY_SYSTEM_PROMPT = (
+    "너는 유튜브 채널을 정해진 카테고리 중 정확히 하나로 분류하는 분류기다. "
+    "반드시 주어진 [허용 카테고리] 안에서만 고르고, 어디에도 맞지 않으면 '기타'를 선택한다. "
+    "채널 이름·설명·최근 영상 제목의 실제 내용에만 근거해 판단하고, 추측·환각을 하지 마라. "
+    "'현재 분류'는 참고일 뿐이며 틀렸다고 판단되면 바로잡는다. "
+    '오직 JSON 객체로만 답한다: {"items":[{"id":"<채널id>","category":"<카테고리>"}, ...]} '
+    "모든 채널의 id를 빠짐없이 포함하라."
+)
+
+
+def build_classify_verify_user_prompt(channels, categories):
+    lines = []
+    for c in channels:
+        titles = [str(t).strip() for t in (c.get("videoTitles") or []) if str(t).strip()][:8]
+        desc = (c.get("description") or "").strip().replace("\n", " ")[:200]
+        block = f"- id: {c.get('id')}\n  이름: {c.get('name', '')}"
+        if desc:
+            block += f"\n  설명: {desc}"
+        if titles:
+            block += f"\n  최근 영상: {' | '.join(titles)}"
+        block += f"\n  현재 분류(참고): {c.get('category', '기타')}"
+        lines.append(block)
+    cats = " / ".join(list(categories) + ["기타"])
+    return (
+        f"[허용 카테고리]\n{cats}\n\n"
+        f"[채널 목록]\n" + "\n".join(lines) + "\n\n"
+        "각 채널을 위 카테고리 중 하나로 분류하라. 맞으면 그대로, 틀렸으면 바로잡아라."
+    )
+
+
+@app.route("/api/classify_verify", methods=["POST"])
+def api_classify_verify():
+    data = request.get_json(silent=True) or {}
+    channels = data.get("channels", [])
+    if not isinstance(channels, list) or not channels:
+        return jsonify({"error": "channels 배열이 비어있습니다."}), 400
+
+    channels = channels[:40]  # 토큰 보호: 한 번에 최대 40개
+    parsed, err = call_solar_json(
+        CLASSIFY_VERIFY_SYSTEM_PROMPT,
+        build_classify_verify_user_prompt(channels, CATEGORY_NAMES),
+        temperature=0,  # 분류는 결정론적으로
+    )
+    if err:
+        return jsonify({"error": err}), 502
+
+    allowed = set(CATEGORY_NAMES) | {"기타"}  # 환각 방지: 허용 목록 밖 카테고리는 버림
+    items = [
+        {"id": it["id"], "category": it["category"]}
+        for it in (parsed.get("items") or [])
+        if it.get("id") and it.get("category") in allowed
+    ]
+    return jsonify({"items": items})
 
 
 if __name__ == "__main__":
