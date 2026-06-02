@@ -9,8 +9,10 @@ let tasteGraph = null; // { communities:[...], edges:[MST...] } — /api/analyze
 let activeFilter = 'all';
 // Takeout 업로드로 산출한 채널별 댓글 수. null = 미업로드 → API 근사로 폴백
 let takeoutCommentsByChannel = null;
-// Takeout 시청 기록 → { [channelId]: { count, lastDate, firstDate } }
+// Takeout 시청 기록 → { [channelId]: { count, lastDate, firstDate, name, videoTitles } }
 let takeoutWatchByChannel = null;
+// 내 YouTube 채널 ID (분석 시 설정) — 추천에서 본인 채널 제외 등에 사용
+let myChannelId = null;
 // 상태 카드용 요약
 const takeoutSummary = { comments: null, watch: null };
 
@@ -285,8 +287,8 @@ async function fetchYouTubeData() {
 
   if (subs.length === 0) throw new Error('구독 채널이 없거나 데이터를 가져올 수 없습니다.');
 
-  // 내 채널 ID (댓글 작성자 매칭용)
-  let myChannelId = null;
+  // 내 채널 ID (댓글 작성자 매칭용 + 추천에서 본인 채널 제외용). 전역에 보관.
+  myChannelId = null;
   try {
     const meRes = await fetchWithRetry(`${BASE}/channels?part=id&mine=true`, {headers});
     if (meRes.ok) {
@@ -588,6 +590,10 @@ function showAiError(msg) {
 
 const RECOMMEND_TARGET = 10; // 최종 확정 추천 개수
 
+// 비구독·최근시청 채널 추천 임계값 (노이즈 컷). 시청기록 JSON 업로드 시에만 동작.
+//   maxDays: 최근 N일 내 시청해야 후보 / minCount: 최소 시청 횟수 / limit: 최대 노출 수
+const WATCHED_REC_OPTS = { maxDays: 90, minCount: 2, limit: 12 };
+
 // 신규 추천을 확정 목록(confirmed)에 중복 없이 병합. limit 도달 시 멈춘다.
 // 기준: 이미 구독 중인 channelId, confirmed의 channelId, 정규화된 이름.
 function mergeRecommendations(confirmed, incoming, limit) {
@@ -619,27 +625,47 @@ function mergeRecommendations(confirmed, incoming, limit) {
 async function runRecommend() {
   aiStart('관심사 키워드를 분석하는 중...');
   try {
-    // 비로그인(데모 등)은 영상 검색 토큰이 없으므로 기존 LLM-이름 방식으로 폴백
-    if (!accessToken) { await runRecommendByLLMNames(); return; }
+    // (B) 비구독·최근시청 채널 — 취향 기반 추천을 '대체'하지 않고 항상 '추가' 섹션으로 함께 노출한다.
+    //     (시청기록 JSON 업로드 시에만 채워짐. 미업로드/HTML 포맷이면 빈 배열 → 기존과 동일 동작)
+    let watchedSeeds = [];
+    let watchedRecs = [];
+    let watchedExclude = new Set();
+    if (accessToken && takeoutWatchByChannel) {
+      watchedSeeds = collectWatchedNotSubscribed(WATCHED_REC_OPTS);
+      watchedExclude = new Set(watchedSeeds.map(w => w.channelId));
+      if (watchedSeeds.length) {
+        document.getElementById('aiLoadingText').textContent = '최근 본 비구독 채널을 정리하는 중...';
+        watchedRecs = await profileWatchedChannels(watchedSeeds);
+      }
+    }
 
-    // ① 관심사 키워드 추출 (상위 채널 + 최근 영상 제목 기반)
-    const keywords = await extractInterestKeywords();
-    if (keywords.length < 2) { await runRecommendByLLMNames(); return; }
+    // 비로그인(데모 등)은 영상 검색 토큰이 없으므로 기존 LLM-이름 방식으로 (watchedRecs 함께 전달)
+    if (!accessToken) { await runRecommendByLLMNames(watchedRecs); return; }
 
-    // ②~③ 영상 우선 탐색 → channelId 빈도 집계 → 실제 후보 발굴 (기구독 제외)
+    // ① 관심사 키워드 추출 (상위 구독 채널 + (A) 비구독·최근시청 채널의 영상 제목 기반)
+    document.getElementById('aiLoadingText').textContent = '관심사 키워드를 분석하는 중...';
+    const keywords = await extractInterestKeywords(watchedSeeds);
+
+    // 키워드가 부족하면 발굴 불가 → LLM-이름 폴백 (비구독·시청 추천은 함께 노출)
+    if (keywords.length < 2) { await runRecommendByLLMNames(watchedRecs); return; }
+
+    // ②~③ 영상 우선 탐색 → channelId 빈도 집계 → 실제 후보 발굴 (기구독 + 비구독·시청 채널 제외)
     document.getElementById('aiLoadingText').textContent =
-      `'${keywords.slice(0, 3).join(', ')} …' 주제의 영상을 올리는 채널을 찾는 중...`;
-    let candidates = await discoverCandidatesByVideo(keywords);
-    if (candidates.length < 3) { await runRecommendByLLMNames(); return; } // 발굴 빈약 시 폴백
+      `'${keywords.slice(0, 3).map(k => k.keyword).join(', ')} …' 주제의 영상을 올리는 채널을 찾는 중...`;
+    let candidates = await discoverCandidatesByVideo(keywords, watchedExclude);
+
+    // 발굴이 빈약하면 LLM-이름 폴백 (비구독·시청 추천은 함께 노출)
+    if (candidates.length < 3) { await runRecommendByLLMNames(watchedRecs); return; }
 
     // ④ 후보 프로파일링 — 실제 제목/설명/영상 제목 (전부 1유닛짜리 싼 엔드포인트)
     document.getElementById('aiLoadingText').textContent = '후보 채널의 실제 영상을 확인하는 중...';
     candidates = await profileCandidates(candidates);
 
-    // ⑤ LLM 큐레이션 — 실제 정보 기반 순위·이유·적합성 (발굴은 안 시킴)
+    // ⑤ LLM 큐레이션 — 실제 정보 기반 순위·이유·적합성 (+ 관심 카테고리별 최소 1개 보장)
     document.getElementById('aiLoadingText').textContent = 'Solar LLM이 추천을 선별하는 중... (10~20초)';
-    const curated = await curateCandidates(candidates, RECOMMEND_TARGET);
-    renderRecommendations(curated);
+    const curated = await curateCandidates(candidates, RECOMMEND_TARGET, topInterestCategories(4));
+
+    renderRecommendations(curated, watchedRecs);
   } catch (e) {
     showAiError(e.message);
   } finally {
@@ -647,33 +673,135 @@ async function runRecommend() {
   }
 }
 
-// 관심사 키워드 추출: 상위 채널 + 최근 영상 제목 → LLM 검색 키워드
-async function extractInterestKeywords() {
-  const withTitles = await attachVideoTitles(allChannels, 12);
-  const interests = withTitles
-    .filter(c => (c.score || 0) >= 50)
-    .slice(0, 12)
-    .map(c => ({ name: c.name, videoTitles: (c.videoTitles || []).slice(0, 6) }));
-  if (!interests.length) return [];
-  try {
-    return await fetchKeywordsRemote(interests);
-  } catch {
-    return [];
+// (A)+(B) 공용: 비구독이면서 최근 시청한 채널을 시청기록에서 추려 빈도×최근성으로 순위.
+//   takeoutWatchByChannel 은 구독 여부와 무관한 전체 시청 채널 맵 → 여기서 비구독만 분리한다.
+function collectWatchedNotSubscribed({ maxDays = 90, minCount = 2, limit = 12 } = {}) {
+  if (!takeoutWatchByChannel) return [];
+  const subscribed = new Set(allChannels.map(c => c.id).filter(Boolean));
+  const todayMs = Date.now();
+  const out = [];
+  for (const [cid, w] of Object.entries(takeoutWatchByChannel)) {
+    if (!cid || subscribed.has(cid) || cid === myChannelId) continue;
+    const lastWatchDays = w.lastDate
+      ? Math.max(0, Math.floor((todayMs - w.lastDate.getTime()) / 86400000))
+      : null;
+    // 노이즈 컷: '최근 maxDays 이내' + '최소 minCount회' 둘 다 만족해야 후보
+    // (시각 없는 HTML 포맷은 lastWatchDays=null → 자동 제외, JSON 포맷에서만 동작)
+    if (lastWatchDays === null || lastWatchDays > maxDays) continue;
+    if ((w.count || 0) < minCount) continue;
+    out.push({
+      channelId: cid,
+      count: w.count || 0,
+      lastWatchDays,
+      name: w.name || '',
+      videoTitles: w.videoTitles || [],
+    });
   }
+  // 빈도를 최근성으로 가중 (최근일수록·자주 볼수록 상위). 60일 반감기 수준의 완만한 감쇠.
+  const rank = s => s.count * Math.exp(-s.lastWatchDays / 60);
+  out.sort((a, b) => rank(b) - rank(a));
+  return out.slice(0, limit);
 }
 
-// 영상 우선 탐색: 키워드별 영상 검색 → channelId 빈도 집계. 비싼 search(100u)는 키워드당 1회만.
-async function discoverCandidatesByVideo(keywords) {
+// (B) 비구독·시청 채널을 channels.list 로 프로파일링(이름·썸네일) → 추천 카드 형태로 변환.
+async function profileWatchedChannels(seeds) {
+  if (!seeds.length || !accessToken) return [];
+  const headers = { Authorization: 'Bearer ' + accessToken };
+  let meta = {};
+  try { meta = await fetchChannelMeta(seeds.map(s => s.channelId), headers); } catch { /* 메타 실패 시 이름만 사용 */ }
+  return seeds.map(s => {
+    const m = meta[s.channelId] || {};
+    const d = s.lastWatchDays;
+    const when = d <= 1 ? '최근' : (d <= 7 ? '이번 주' : `${d}일 전`);
+    return {
+      channelId: s.channelId,
+      name: m.title || s.name || '',
+      actualName: m.title || s.name || '',
+      thumbnail: m.thumbnail || null,
+      category: '최근 시청 · 미구독',
+      reason: `${when} 시청 · 총 ${s.count}회 봤지만 아직 구독 안 함`,
+    };
+  }).filter(r => r.actualName);
+}
+
+// 구독 채널의 분류 결과(category)로 사용자의 '관심 카테고리'를 점수 가중 상위 N개 도출.
+//   예: { 요리: 큰 가중, 경제: 중간, 게임: 중간 } → [요리, 경제, 게임]
+//   추천이 요리에 쏠리지 않고 경제·게임도 최소 1개씩 나오게 하는 다양성의 기준이 된다.
+function topInterestCategories(maxCats = 4) {
+  const weight = {};
+  for (const c of allChannels) {
+    const cat = c.category;
+    if (!cat || cat === '기타' || cat === '채널') continue;
+    if ((c.score || 0) < 10) continue; // 휴면(0점)·무관심 채널은 관심 카테고리에서 제외
+    weight[cat] = (weight[cat] || 0) + (c.score || 0);
+  }
+  return Object.entries(weight).sort((a, b) => b[1] - a[1]).slice(0, maxCats).map(([c]) => c);
+}
+
+// 관심사 키워드 추출 — 카테고리별로 분리·균형 추출해 각 키워드에 '출처 카테고리'를 태깅한다.
+//   반환: [{ keyword, category }]  (category가 ''면 카테고리 미상/폴백)
+//   요리가 구독의 대부분이어도 경제·게임 키워드가 검색에 반드시 포함되도록 라운드로빈으로 인터리브.
+async function extractInterestKeywords(watchedSeeds = []) {
+  const withTitles = await attachVideoTitles(allChannels, 18);
+  const cats = topInterestCategories(4);
+
+  // 카테고리별 키워드 추출 (병렬). 키워드 수는 카테고리당 상한을 둬 한 카테고리 독식 방지.
+  const perCat = cats.length <= 2 ? 4 : 3;
+  const lists = await Promise.all(cats.map(async (cat) => {
+    const interests = withTitles
+      .filter(c => c.category === cat && (c.score || 0) >= 10)
+      .slice(0, 6)
+      .map(c => ({ name: c.name, videoTitles: (c.videoTitles || []).slice(0, 6) }));
+    if (!interests.length) return { cat, kws: [] };
+    try { return { cat, kws: (await fetchKeywordsRemote(interests)).slice(0, perCat) }; }
+    catch { return { cat, kws: [] }; }
+  }));
+
+  // (A) 비구독·최근시청 채널도 한 그룹으로 (카테고리 미상 → '최근시청' 태그)
+  const watchedInterests = watchedSeeds
+    .filter(w => w.name || (w.videoTitles && w.videoTitles.length))
+    .slice(0, 6)
+    .map(w => ({ name: w.name || '최근 시청 채널', videoTitles: (w.videoTitles || []).slice(0, 6) }));
+  if (watchedInterests.length) {
+    try { lists.push({ cat: '최근시청', kws: (await fetchKeywordsRemote(watchedInterests)).slice(0, 3) }); }
+    catch { /* 무시 */ }
+  }
+
+  // 폴백: 카테고리 분류가 빈약해 키워드가 하나도 안 나오면 기존 방식(상위 채널 평면 키워드)
+  if (!lists.some(l => l.kws.length)) {
+    const interests = withTitles.filter(c => (c.score || 0) >= 50).slice(0, 12)
+      .map(c => ({ name: c.name, videoTitles: (c.videoTitles || []).slice(0, 6) }));
+    if (!interests.length) return [];
+    try { return (await fetchKeywordsRemote(interests)).map(k => ({ keyword: k, category: '' })); }
+    catch { return []; }
+  }
+
+  // 라운드로빈 인터리브 → 이후 8개로 잘려도 모든 카테고리가 최소 1개씩 검색에 포함된다.
+  const tagged = [];
+  for (let i = 0, added = true; added; i++) {
+    added = false;
+    for (const l of lists) {
+      if (l.kws[i]) { tagged.push({ keyword: l.kws[i], category: l.cat }); added = true; }
+    }
+  }
+  return tagged;
+}
+
+// 영상 우선 탐색: (카테고리 태깅된) 키워드별 영상 검색 → channelId 빈도 집계. 비싼 search(100u)는 키워드당 1회만.
+//   taggedKeywords: [{ keyword, category }] — 각 후보가 어느 관심 카테고리에서 발굴됐는지 추적한다.
+async function discoverCandidatesByVideo(taggedKeywords, excludeIds = new Set()) {
   const headers = { Authorization: 'Bearer ' + accessToken };
   const BASE = 'https://www.googleapis.com/youtube/v3';
-  const subscribed = new Set(allChannels.map(c => c.id).filter(Boolean));
+  // 기구독 채널 + (B)로 따로 노출할 비구독·시청 채널을 발굴 대상에서 제외 → 중복 방지
+  const subscribed = new Set([...allChannels.map(c => c.id).filter(Boolean), ...excludeIds]);
   const freq = new Map();         // channelId → 등장한 키워드 수
   const searchTitles = new Map(); // channelId → 검색에서 본 영상 제목 일부
+  const candCats = new Map();      // channelId → Set(출처 카테고리)
 
-  const KW = keywords.slice(0, 8); // 쿼터 보호: 최대 8개 키워드(=800유닛)
-  for (const kw of KW) {
+  const KW = taggedKeywords.slice(0, 8); // 쿼터 보호: 최대 8개 키워드(=800유닛)
+  for (const { keyword, category } of KW) {
     try {
-      const url = `${BASE}/search?part=snippet&type=video&order=relevance&maxResults=50&q=${encodeURIComponent(kw)}`;
+      const url = `${BASE}/search?part=snippet&type=video&order=relevance&maxResults=50&q=${encodeURIComponent(keyword)}`;
       const res = await fetchWithRetry(url, { headers });
       if (!res.ok) continue;
       const data = await res.json();
@@ -682,17 +810,39 @@ async function discoverCandidatesByVideo(keywords) {
         const cid = item.snippet?.channelId;
         if (!cid || subscribed.has(cid)) continue;
         if (!seenThisKw.has(cid)) { freq.set(cid, (freq.get(cid) || 0) + 1); seenThisKw.add(cid); }
+        if (category && category !== '최근시청') {
+          const s = candCats.get(cid) || new Set(); s.add(category); candCats.set(cid, s);
+        }
         const t = item.snippet?.title;
         if (t) { const arr = searchTitles.get(cid) || []; if (arr.length < 5) { arr.push(t); searchTitles.set(cid, arr); } }
       }
     } catch { /* 키워드 단위 실패는 무시 */ }
   }
 
-  // 2개 이상 키워드에서 등장한 채널을 우선(진짜 그 주제 채널). 부족하면 빈도순으로 보강.
+  // 풀 구성: ① 각 카테고리에서 빈도 상위 2개씩 먼저 확보(경제·게임 같은 소수 취향도 후보 보존)
+  //          ② 나머지는 빈도순으로 30개까지 채움. → 큐레이션이 카테고리 커버리지를 만들 수 있게 한다.
   const entries = [...freq.entries()].sort((a, b) => b[1] - a[1]);
-  const strong = entries.filter(([, n]) => n >= 2);
-  const pool = (strong.length >= 12 ? strong : entries).slice(0, 30);
-  return pool.map(([cid, n]) => ({ channelId: cid, frequency: n, searchTitles: searchTitles.get(cid) || [] }));
+  const byCat = {};
+  for (const [cid, n] of entries) {
+    for (const cat of (candCats.get(cid) || [])) (byCat[cat] = byCat[cat] || []).push([cid, n]);
+  }
+  const picked = new Set();
+  const pool = [];
+  for (const cat of Object.keys(byCat)) {
+    for (const [cid, n] of byCat[cat].slice(0, 2)) {
+      if (!picked.has(cid)) { picked.add(cid); pool.push([cid, n]); }
+    }
+  }
+  for (const [cid, n] of entries) {
+    if (pool.length >= 30) break;
+    if (!picked.has(cid)) { picked.add(cid); pool.push([cid, n]); }
+  }
+  return pool.map(([cid, n]) => ({
+    channelId: cid,
+    frequency: n,
+    searchTitles: searchTitles.get(cid) || [],
+    categories: [...(candCats.get(cid) || [])],
+  }));
 }
 
 // 후보 프로파일링: 실제 제목/설명/썸네일(channels.list) + 최근 영상 제목(uploads) — 전부 싼 엔드포인트.
@@ -715,7 +865,8 @@ async function profileCandidates(candidates) {
 }
 
 // LLM 큐레이션: 발굴된 실제 후보 중에서 선별·순위. fit=false 제외, 부족하면 빈도순 보강으로 목표치 채움.
-async function curateCandidates(profiled, count) {
+//   interestCats: 사용자의 관심 카테고리(요리·경제·게임…) — 각 카테고리마다 최소 1개를 보장(다양성).
+async function curateCandidates(profiled, count, interestCats = []) {
   const interests = allChannels
     .filter(c => (c.score || 0) >= 50)
     .slice(0, 15)
@@ -759,11 +910,41 @@ async function curateCandidates(profiled, count) {
       out.push({ ...p, category: p.category || '', reason: p.reason || '관심사 키워드에서 반복 등장한 채널' });
     }
   }
+
+  // 카테고리 다양성: 결과가 한 카테고리(예: 요리)에 쏠리면, 사용자의 다른 관심 카테고리(경제·게임 등)도
+  //   '최소 1개씩' 보장한다. 해당 카테고리 후보가 발굴됐을 때만 적용(없으면 조용히 건너뜀).
+  if (interestCats.length) {
+    const catsOf = p => (p.categories || []);
+    for (const cat of interestCats) {
+      if (out.some(p => catsOf(p).includes(cat))) continue; // 이미 커버됨
+      const chosenIds = new Set(out.map(p => p.channelId));
+      const cand = profiled.find(p =>
+        !chosenIds.has(p.channelId) &&
+        !rejected.has(p.actualName || p.name) &&
+        catsOf(p).includes(cat));
+      if (!cand) continue; // 그 카테고리 후보가 발굴 안 됨 → 보장 불가, 건너뜀
+      const pick = { ...cand, category: cand.category || cat, reason: cand.reason || `'${cat}' 관심사에 맞춘 추천` };
+      if (out.length < count) {
+        out.push(pick);
+      } else {
+        // 슬롯이 꽉 참: '같은 카테고리가 2개 이상 중복된' 항목 중 빈도 최저를 교체(단일 대표는 보호).
+        const catCount = {};
+        out.forEach(p => catsOf(p).forEach(c => { catCount[c] = (catCount[c] || 0) + 1; }));
+        let idx = -1, minF = Infinity;
+        out.forEach((p, i) => {
+          const redundant = catsOf(p).length > 0 && catsOf(p).every(c => catCount[c] > 1);
+          if (redundant && (p.frequency || 0) < minF) { minF = p.frequency || 0; idx = i; }
+        });
+        if (idx >= 0) out[idx] = pick; // 보호 대상뿐이면 강제 교체하지 않음
+      }
+    }
+  }
   return out;
 }
 
 // 폴백: 기존 LLM-이름 생성 → 해석 → 검증 방식 (비로그인/발굴 빈약 시)
-async function runRecommendByLLMNames() {
+//   watchedRecs: 비구독·최근시청 채널 추천 — 모든 렌더에 함께 얹어 '대체'가 아니라 '추가'로 노출한다.
+async function runRecommendByLLMNames(watchedRecs = []) {
   document.getElementById('aiLoadingText').textContent = 'Solar LLM이 새 채널을 추천하는 중... (10~20초)';
   {
     const confirmed = [];          // 검증을 통과한 최종 추천 (최대 RECOMMEND_TARGET)
@@ -781,7 +962,7 @@ async function runRecommendByLLMNames() {
 
       // 첫 라운드는 빠른 1차 렌더(미검증, 검색 링크) → 사용자가 바로 볼 수 있게
       if (round === 0) {
-        renderRecommendations(mergeRecommendations([], recs, RECOMMEND_TARGET));
+        renderRecommendations(mergeRecommendations([], recs, RECOMMEND_TARGET), watchedRecs);
       }
 
       // 실제 YouTube 채널로 해석 → channelId + 실제 설명/영상 제목/썸네일
@@ -797,12 +978,12 @@ async function runRecommendByLLMNames() {
       recs = await verifyRecommendations(recs);
 
       mergeRecommendations(confirmed, recs, RECOMMEND_TARGET);
-      renderRecommendations(confirmed);
+      renderRecommendations(confirmed, watchedRecs);
     }
 
     if (confirmed.length < RECOMMEND_TARGET) {
       // 취향 폭이 좁아 더 못 채운 경우: 가진 만큼만 노출 (best-effort)
-      renderRecommendations(confirmed);
+      renderRecommendations(confirmed, watchedRecs);
     }
   }
   // 예외는 호출부(runRecommend)의 try/catch/finally가 처리한다 (aiEnd 중복 방지)
@@ -1065,42 +1246,58 @@ async function verifyRecommendations(recs) {
   return result.length ? result : recs;
 }
 
-function renderRecommendations(recs) {
+// 단일 추천 카드 HTML (발굴 추천·비구독 시청 추천 양쪽에서 공용)
+function recommendCardHtml(r) {
+  const displayName = escapeHtml(r.actualName || r.name || '이름 없음');
+  const category = escapeHtml(r.category || '');
+  const reason = escapeHtml(r.reason || '');
+  const initial = escapeHtml((r.actualName || r.name || '?').trim().charAt(0).toUpperCase());
+
+  // channelId 있으면 채널로 바로 이동, 없으면 검색 결과로 폴백
+  const linkUrl = r.channelId
+    ? `https://www.youtube.com/channel/${encodeURIComponent(r.channelId)}`
+    : `https://www.youtube.com/results?search_query=${encodeURIComponent(r.name || '')}`;
+  const linkLabel = r.channelId ? '채널로 이동 →' : '유튜브에서 찾기 →';
+
+  const thumbHtml = r.thumbnail
+    ? `<img class="recommend-thumb" src="${escapeHtml(r.thumbnail)}" alt="${displayName}" loading="lazy"
+          onerror="this.outerHTML='<div class=&quot;recommend-thumb recommend-thumb-fallback&quot;>${initial}</div>'"/>`
+    : `<div class="recommend-thumb recommend-thumb-fallback">${initial}</div>`;
+
+  return `
+    <div class="recommend-card">
+      ${thumbHtml}
+      <div class="recommend-body">
+        <div class="recommend-name">${displayName}</div>
+        ${category ? `<div class="recommend-cat">${category}</div>` : ''}
+        <div class="recommend-reason">${reason}</div>
+      </div>
+      <a class="recommend-link" href="${linkUrl}" target="_blank" rel="noopener">${linkLabel}</a>
+    </div>`;
+}
+
+// recs        : 취향 기반으로 새로 발굴한 채널 (A 경로)
+// watchedRecs : 구독 안 했지만 최근 본 채널 (B 경로) — 있으면 별도 섹션을 위에 노출
+function renderRecommendations(recs, watchedRecs = []) {
   const out = document.getElementById('aiOutput');
-  if (!recs || !recs.length) {
+  recs = recs || [];
+  if (!recs.length && !watchedRecs.length) {
     out.innerHTML = `<div class="recommend-empty">추천 결과가 없습니다.</div>`;
     return;
   }
-  const cards = recs.map((r) => {
-    const displayName = escapeHtml(r.actualName || r.name || '이름 없음');
-    const category = escapeHtml(r.category || '');
-    const reason = escapeHtml(r.reason || '');
-    const initial = escapeHtml((r.actualName || r.name || '?').trim().charAt(0).toUpperCase());
+  const sectionTitle = (txt, color) =>
+    `<div style="font-weight:700;color:${color};margin:2px 2px 10px;font-size:15px;">${txt}</div>`;
 
-    // channelId 있으면 채널로 바로 이동, 없으면 검색 결과로 폴백
-    const linkUrl = r.channelId
-      ? `https://www.youtube.com/channel/${encodeURIComponent(r.channelId)}`
-      : `https://www.youtube.com/results?search_query=${encodeURIComponent(r.name || '')}`;
-    const linkLabel = r.channelId ? '채널로 이동 →' : '유튜브에서 찾기 →';
-
-    const thumbHtml = r.thumbnail
-      ? `<img class="recommend-thumb" src="${escapeHtml(r.thumbnail)}" alt="${displayName}" loading="lazy"
-            onerror="this.outerHTML='<div class=&quot;recommend-thumb recommend-thumb-fallback&quot;>${initial}</div>'"/>`
-      : `<div class="recommend-thumb recommend-thumb-fallback">${initial}</div>`;
-
-    return `
-      <div class="recommend-card">
-        ${thumbHtml}
-        <div class="recommend-body">
-          <div class="recommend-name">${displayName}</div>
-          ${category ? `<div class="recommend-cat">${category}</div>` : ''}
-          <div class="recommend-reason">${reason}</div>
-        </div>
-        <a class="recommend-link" href="${linkUrl}" target="_blank" rel="noopener">${linkLabel}</a>
-      </div>
-    `;
-  }).join('');
-  out.innerHTML = `<div class="recommend-list">${cards}</div>`;
+  let html = '';
+  if (watchedRecs.length) {
+    html += sectionTitle('📺 최근 보지만 구독 안 한 채널', 'var(--accent2)');
+    html += `<div class="recommend-list">${watchedRecs.map(recommendCardHtml).join('')}</div>`;
+  }
+  if (recs.length) {
+    if (watchedRecs.length) html += sectionTitle('✨ 취향 기반 새 채널 추천', 'var(--accent)');
+    html += `<div class="recommend-list">${recs.map(recommendCardHtml).join('')}</div>`;
+  }
+  out.innerHTML = html;
 }
 
 // 시청 취향 페르소나 렌더
@@ -1404,8 +1601,15 @@ function parseWatchHistoryJSON(text) {
     if (!m) continue;
     const cid = m[1];
     const t = entry.time ? new Date(entry.time) : null;
-    if (!result[cid]) result[cid] = { count: 0, lastDate: null, firstDate: null };
+    if (!result[cid]) result[cid] = { count: 0, lastDate: null, firstDate: null, name: '', videoTitles: [] };
     result[cid].count++;
+    // 채널명(subtitles[0].name) + 시청한 영상 제목(entry.title)을 추가 API 비용 없이 확보
+    // → 비구독·최근시청 채널을 추천 근거로 활용 (취향 씨앗 + 직접 추천)
+    if (!result[cid].name && sub.name) result[cid].name = sub.name;
+    if (entry.title && result[cid].videoTitles.length < 6) {
+      const vt = String(entry.title).replace(/\s*을\(를\)\s*시청함\s*$/, '').replace(/^Watched\s+/, '').trim();
+      if (vt && !result[cid].videoTitles.includes(vt)) result[cid].videoTitles.push(vt);
+    }
     if (t && !isNaN(t.getTime())) {
       if (!result[cid].lastDate || t > result[cid].lastDate) result[cid].lastDate = t;
       if (!result[cid].firstDate || t < result[cid].firstDate) result[cid].firstDate = t;
