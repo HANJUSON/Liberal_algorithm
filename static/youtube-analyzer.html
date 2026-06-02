@@ -177,6 +177,19 @@
   <!-- 결과 -->
   <div class="results" id="results">
     <div class="summary-grid" id="summaryGrid"></div>
+
+    <!-- 취향 커뮤니티 (Union-Find 연결요소) + 취향 지도 (Kruskal MST) -->
+    <div class="taste-graph-section" id="tasteGraphSection" style="display:none">
+      <div class="taste-block">
+        <div class="taste-title">🧩 취향 커뮤니티 <span class="taste-sub">(유사도 그래프의 연결요소 · Union-Find)</span></div>
+        <div class="community-list" id="communityList"></div>
+      </div>
+      <div class="taste-block">
+        <div class="taste-title">🗺️ 취향 지도 <span class="taste-sub">(최대 신장 트리 · Kruskal MST)</span></div>
+        <div class="taste-map-wrap"><svg id="tasteMap" class="taste-map"></svg></div>
+      </div>
+    </div>
+
     <div class="filter-bar" id="filterBar"></div>
     <div class="channel-list" id="channelList"></div>
 

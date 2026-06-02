@@ -5,6 +5,7 @@ let accessToken = null;
 let clientId = '';
 let userInfo = null;
 let allChannels = [];
+let tasteGraph = null; // { communities:[...], edges:[MST...] } — /api/analyze·/api/demo 응답
 let activeFilter = 'all';
 // Takeout 업로드로 산출한 채널별 댓글 수. null = 미업로드 → API 근사로 폴백
 let takeoutCommentsByChannel = null;
@@ -30,6 +31,7 @@ async function analyzeChannelsRemote(channels) {
     throw new Error(err.error || `분석 서버 오류 (${res.status})`);
   }
   const data = await res.json();
+  tasteGraph = data.graph || null;
   return data.channels;
 }
 
@@ -37,6 +39,7 @@ async function fetchDemoRemote() {
   const res = await fetch(`${API_BASE}/api/demo`);
   if (!res.ok) throw new Error(`데모 서버 오류 (${res.status})`);
   const data = await res.json();
+  tasteGraph = data.graph || null;
   return data.channels;
 }
 
@@ -490,6 +493,7 @@ function showResults(channels) {
   allChannels = channels;
   activeFilter = 'all';
   renderSummary(channels);
+  renderTasteGraph(channels, tasteGraph);
   renderFilterBar(channels);
   renderList(channels);
   resetAiSection();
@@ -1177,6 +1181,101 @@ function renderSummary(channels) {
       <div class="stat-label">적극 교류 채널 (50점+)</div>
     </div>
   `;
+}
+
+// ──────────────────────────────────────────
+// 취향 커뮤니티(Union-Find 연결요소) + 취향 지도(Kruskal MST) 렌더
+// ──────────────────────────────────────────
+const CAT_PALETTE = ['#ff4444','#ff8800','#ffcc00','#66cc66','#33bbdd','#7c6cff','#ff66aa','#22aa88','#bb88ff','#88aa44'];
+function catColor(cat) {
+  const s = String(cat || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return CAT_PALETTE[h % CAT_PALETTE.length];
+}
+
+function renderTasteGraph(channels, graph) {
+  const section = document.getElementById('tasteGraphSection');
+  if (!section) return;
+  const comms = (graph && graph.communities) || [];
+  const edges = (graph && graph.edges) || [];
+  if (!comms.length) { section.style.display = 'none'; return; } // 묶일 커뮤니티가 없으면 숨김
+  section.style.display = 'block';
+
+  // 커뮤니티 카드
+  document.getElementById('communityList').innerHTML = comms.map(c => `
+    <div class="community-card" style="border-left-color:${catColor(c.label)}">
+      <div class="community-head">
+        <span class="community-label" style="color:${catColor(c.label)}">${escapeHtml(c.label)}</span>
+        <span class="community-size">${c.size}개 채널</span>
+      </div>
+      <div class="community-members">${c.members.map(m => escapeHtml(m)).join(' · ')}</div>
+    </div>
+  `).join('');
+
+  drawTasteMap(channels, edges); // MST 취향 지도
+}
+
+// MST 엣지를 force-directed SVG로 그린다. 커뮤니티에 속한 채널만, 많으면 점수 상위로 캡.
+function drawTasteMap(channels, edges) {
+  const svg = document.getElementById('tasteMap');
+  if (!svg) return;
+  const W = 660, H = 460, cx = W / 2, cy = H / 2;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const inGraph = channels.filter(c => c.community !== null && c.community !== undefined);
+  const CAP = 70;
+  let nodes = inGraph, truncated = 0;
+  if (nodes.length > CAP) { truncated = nodes.length - CAP; nodes = [...nodes].sort((a,b)=>(b.score||0)-(a.score||0)).slice(0, CAP); }
+  const idset = new Set(nodes.map(n => n.id));
+  const E = edges.filter(e => idset.has(e.source) && idset.has(e.target));
+  if (nodes.length < 2 || !E.length) { svg.innerHTML = ''; return; }
+
+  const N = nodes.length;
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  // 초기 위치: 원형 배치(결정론적 — 새로고침해도 같은 그림)
+  const pos = nodes.map((n, i) => ({
+    x: cx + Math.cos(2*Math.PI*i/N) * 170,
+    y: cy + Math.sin(2*Math.PI*i/N) * 150, vx: 0, vy: 0,
+  }));
+  const links = E.map(e => ({ s: idx.get(e.source), t: idx.get(e.target), w: e.weight }));
+
+  // 간단 force 시뮬레이션: 노드 반발(O(n²)) + 엣지 스프링 + 중심 끌림
+  for (let it = 0; it < 200; it++) {
+    for (let a = 0; a < N; a++) for (let b = a+1; b < N; b++) {
+      let dx = pos[a].x-pos[b].x, dy = pos[a].y-pos[b].y;
+      let d2 = dx*dx + dy*dy || 0.01, d = Math.sqrt(d2);
+      let f = 2600 / d2, fx = f*dx/d, fy = f*dy/d;
+      pos[a].vx += fx; pos[a].vy += fy; pos[b].vx -= fx; pos[b].vy -= fy;
+    }
+    for (const l of links) {
+      let A = pos[l.s], B = pos[l.t];
+      let dx = B.x-A.x, dy = B.y-A.y, d = Math.sqrt(dx*dx+dy*dy) || 0.01;
+      let f = (d - 62) * 0.06, fx = f*dx/d, fy = f*dy/d;
+      A.vx += fx; A.vy += fy; B.vx -= fx; B.vy -= fy;
+    }
+    for (let a = 0; a < N; a++) {
+      pos[a].vx += (cx-pos[a].x)*0.004; pos[a].vy += (cy-pos[a].y)*0.004;
+      pos[a].x += pos[a].vx*0.82; pos[a].y += pos[a].vy*0.82;
+      pos[a].vx *= 0.82; pos[a].vy *= 0.82;
+    }
+  }
+  const pad = 26;
+  for (const p of pos) { p.x = Math.max(pad, Math.min(W-pad, p.x)); p.y = Math.max(pad, Math.min(H-pad, p.y)); }
+
+  const svgEdges = links.map(l => {
+    const A = pos[l.s], B = pos[l.t];
+    return `<line x1="${A.x.toFixed(1)}" y1="${A.y.toFixed(1)}" x2="${B.x.toFixed(1)}" y2="${B.y.toFixed(1)}" stroke="#555" stroke-width="${(0.6 + l.w*1.6).toFixed(2)}" stroke-opacity="0.5"/>`;
+  }).join('');
+  const svgNodes = nodes.map((n, i) => {
+    const p = pos[i], r = 5 + Math.min(10, (n.score||0)/12);
+    const showLabel = r >= 8 || N <= 24;
+    const name = escapeHtml((n.name||'').slice(0, 10));
+    return `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${catColor(n.category)}" fill-opacity="0.85" stroke="#0b0b0b" stroke-width="1"><title>${escapeHtml(n.name||'')}</title></circle>`
+      + (showLabel ? `<text x="${p.x.toFixed(1)}" y="${(p.y + r + 9).toFixed(1)}" text-anchor="middle" class="taste-map-label">${name}</text>` : '');
+  }).join('');
+  const note = truncated ? `<text x="${W-8}" y="${H-8}" text-anchor="end" class="taste-map-note">상위 ${CAP}개만 표시 (+${truncated})</text>` : '';
+  svg.innerHTML = svgEdges + svgNodes + note;
 }
 
 function renderFilterBar() {

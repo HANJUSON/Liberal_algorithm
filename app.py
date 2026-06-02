@@ -284,11 +284,17 @@ def classify_cached(ch):
 
 
 # ──────────────────────────────────────────
-# 코사인 유사도 (카테고리 벡터 기반)
+# 코사인 유사도 + 그래프 알고리즘 (카테고리 벡터 기반)
 #   분류 결과 categoryScores 벡터를 재사용 → 추가 API 호출 없이:
-#     - representativeness: 내 취향 중심(centroid) 대비 채널의 대표성 (0~1)
-#     - similar: 같은 구독 목록 안에서 카테고리적으로 가장 비슷한 채널 Top N
+#     - representativeness: 취향 중심(centroid) 대비 채널 대표성 (0~1)
+#     - similar: 카테고리적으로 가장 비슷한 채널 Top N
+#     - 방법1) Union-Find 연결요소 → "취향 커뮤니티"
+#     - 방법2) Kruskal 최대 신장 포레스트 → "취향 지도"(MST 엣지)
+#   유사도가 threshold 이상인 채널쌍을 가중 그래프의 엣지로 본다.
 # ──────────────────────────────────────────
+SIMILARITY_EDGE_THRESHOLD = 0.35  # 그래프 엣지로 인정할 최소 코사인 유사도
+
+
 def cosine_similarity(v1, v2):
     """두 희소 카테고리 벡터(dict)의 코사인 유사도. 빈 벡터/무교집합이면 0."""
     if not v1 or not v2:
@@ -303,45 +309,119 @@ def cosine_similarity(v1, v2):
     return dot / (n1 * n2)
 
 
-def attach_similarity(scored, top_k=3):
-    """scored 채널들에 representativeness/similar 필드를 얹는다(점수·정렬엔 영향 없음)."""
-    vecs = [(ch, ch.get("categoryScores") or {}) for ch in scored]
+class UnionFind:
+    """서로소 집합 — 경로 압축(path halving) + 랭크 합치기. 거의 O(α(n))≈O(1)."""
+    def __init__(self, n):
+        self.parent = list(range(n))
+        self.rank = [0] * n
 
-    # 취향 중심(centroid): 각 채널 벡터를 관심도 점수로 가중 합산.
-    # 활동이 있는(점수>0) 채널이 취향을 정의한다. 전부 0점이면 균등 가중으로 폴백.
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+        return True
+
+
+def attach_similarity_and_graph(scored, top_k=3, threshold=SIMILARITY_EDGE_THRESHOLD):
+    """채널에 representativeness/similar/community를 얹고, 취향 그래프를 반환한다.
+    반환: {"communities": [...], "edges": [MST 엣지...]} — 점수·정렬엔 영향 없음.
+    """
+    n = len(scored)
+    vecs = [ch.get("categoryScores") or {} for ch in scored]
+
+    # 취향 중심(centroid): 활동 점수로 가중 합산. 전부 0점이면 균등 가중으로 폴백.
     centroid = {}
-    for ch, v in vecs:
+    for ch, v in zip(scored, vecs):
         w = ch.get("score", 0)
         if w <= 0 or not v:
             continue
         for k, val in v.items():
             centroid[k] = centroid.get(k, 0.0) + w * val
     if not centroid:
-        for ch, v in vecs:
+        for v in vecs:
             for k, val in v.items():
                 centroid[k] = centroid.get(k, 0.0) + val
-
-    for ch, v in vecs:
+    for ch, v in zip(scored, vecs):
         ch["representativeness"] = round(cosine_similarity(v, centroid), 2) if v else 0.0
 
-    # 채널 간 유사도 Top-K — 벡터가 있는 채널끼리만 비교 (O(n²)·작은 벡터라 저렴)
-    nonempty = [(ch, v) for ch, v in vecs if v]
-    for ch, v in nonempty:
-        sims = []
-        for other, ov in nonempty:
-            if other is ch:
+    # 단일 O(n²) 패스: per-node 유사도 + 그래프 엣지(>= threshold) 동시 수집
+    sims = [[] for _ in range(n)]
+    edges = []  # (sim, i, j)
+    for i in range(n):
+        vi = vecs[i]
+        if not vi:
+            continue
+        for j in range(i + 1, n):
+            vj = vecs[j]
+            if not vj:
                 continue
-            s = cosine_similarity(v, ov)
-            if s > 0:
-                sims.append((s, other))
-        sims.sort(key=lambda x: (-x[0], x[1].get("name") or ""))  # 유사도 내림차순, 이름으로 tie-break
+            s = cosine_similarity(vi, vj)
+            if s <= 0:
+                continue
+            sims[i].append((s, j))
+            sims[j].append((s, i))
+            if s >= threshold:
+                edges.append((s, i, j))
+
+    for i, ch in enumerate(scored):
+        top = sorted(sims[i], key=lambda x: (-x[0], scored[x[1]].get("name") or ""))[:top_k]
         ch["similar"] = [
-            {"id": o.get("id"), "name": o.get("name"), "similarity": round(s, 2)}
-            for s, o in sims[:top_k]
+            {"id": scored[j].get("id"), "name": scored[j].get("name"), "similarity": round(s, 2)}
+            for s, j in top
         ]
-    for ch, v in vecs:
-        ch.setdefault("similar", [])  # 분류 안 된 채널은 빈 리스트
-    return scored
+
+    # ── 방법 1: Union-Find 연결요소 → 취향 커뮤니티 ──
+    uf = UnionFind(n)
+    for s, i, j in edges:
+        uf.union(i, j)
+    comp_map = {}
+    for idx in range(n):
+        comp_map.setdefault(uf.find(idx), []).append(idx)
+    comps = sorted((m for m in comp_map.values() if len(m) >= 2), key=len, reverse=True)
+
+    for ch in scored:
+        ch["community"] = None  # 단독(같은 취향 이웃 없음) 채널은 커뮤니티 없음
+    communities = []
+    for cid, members in enumerate(comps):
+        cat_count = {}
+        for m in members:
+            c = scored[m].get("category") or UNCLASSIFIED_CATEGORY
+            cat_count[c] = cat_count.get(c, 0) + 1
+            scored[m]["community"] = cid
+        label = max(cat_count, key=lambda c: cat_count[c])  # 대표 카테고리 = 최빈값
+        top_idx = max(members, key=lambda m: scored[m].get("score", 0))
+        communities.append({
+            "id": cid,
+            "label": label,
+            "size": len(members),
+            "topChannel": scored[top_idx].get("name"),
+            "members": [scored[m].get("name") for m in members],
+        })
+
+    # ── 방법 2: Kruskal 최대 신장 포레스트 → 취향 지도(MST 엣지) ──
+    # 유사도 내림차순으로 강한 엣지부터 채택, 사이클이면 버림 → 커뮤니티별 트리.
+    uf2 = UnionFind(n)
+    mst_edges = []
+    for s, i, j in sorted(edges, key=lambda e: -e[0]):
+        if uf2.union(i, j):
+            mst_edges.append({
+                "source": scored[i].get("id"),
+                "target": scored[j].get("id"),
+                "weight": round(s, 2),
+            })
+
+    return {"communities": communities, "edges": mst_edges}
 
 
 # ──────────────────────────────────────────
@@ -387,9 +467,14 @@ def analyze_channels(channels):
             unclassified, len(channels), ratio, CATEGORY_VERSION,
         )
 
-    # 카테고리 벡터 기반 코사인 유사도(취향 대표성 + 비슷한 채널)를 얹는다.
-    attach_similarity(scored)
-    return heap_sort_desc(scored)
+    # 카테고리 벡터 기반 코사인 유사도 + 그래프(취향 커뮤니티/지도)를 얹는다.
+    graph = attach_similarity_and_graph(scored)
+    if channels:
+        app.logger.info(
+            "[graph] 취향 커뮤니티 %d개 · MST 엣지 %d개",
+            len(graph["communities"]), len(graph["edges"]),
+        )
+    return heap_sort_desc(scored), graph
 
 
 # ──────────────────────────────────────────
@@ -428,12 +513,14 @@ def api_analyze():
     channels = data.get("channels", [])
     if not isinstance(channels, list):
         return jsonify({"error": "channels must be a list"}), 400
-    return jsonify({"channels": analyze_channels(channels)})
+    sorted_ch, graph = analyze_channels(channels)
+    return jsonify({"channels": sorted_ch, "graph": graph})
 
 
 @app.route("/api/demo", methods=["GET"])
 def api_demo():
-    return jsonify({"channels": analyze_channels(DEMO_CHANNELS)})
+    sorted_ch, graph = analyze_channels(DEMO_CHANNELS)
+    return jsonify({"channels": sorted_ch, "graph": graph})
 
 
 # ──────────────────────────────────────────

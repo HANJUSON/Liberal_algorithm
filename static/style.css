@@ -383,6 +383,23 @@ input::placeholder { color: var(--text3); }
 .meta-tag.meta-cat { color: var(--accent2); }
 .meta-tag.meta-cat .dot { background: var(--accent2); }
 .channel-similar { margin-top: 5px; font-family: var(--mono); font-size: 10px; color: var(--text3); }
+
+/* 취향 커뮤니티(Union-Find) + 취향 지도(MST) */
+.taste-graph-section { margin: 24px 0; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 760px) { .taste-graph-section { grid-template-columns: 1fr; } }
+.taste-block { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.taste-title { font-family: var(--sans); font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
+.taste-sub { font-family: var(--mono); font-size: 10px; font-weight: 400; color: var(--text2); }
+.community-list { display: flex; flex-direction: column; gap: 8px; }
+.community-card { background: var(--surface2); border-left: 3px solid var(--accent); border-radius: 6px; padding: 9px 12px; }
+.community-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.community-label { font-family: var(--sans); font-size: 13px; font-weight: 600; }
+.community-size { font-family: var(--mono); font-size: 10px; color: var(--text2); flex-shrink: 0; }
+.community-members { margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--text2); line-height: 1.5; }
+.taste-map-wrap { width: 100%; }
+.taste-map { width: 100%; height: auto; display: block; background: var(--surface2); border-radius: 8px; }
+.taste-map-label { font-family: var(--mono); font-size: 8px; fill: var(--text2); }
+.taste-map-note { font-family: var(--mono); font-size: 9px; fill: var(--text3); }
 .score-section { text-align: right; flex-shrink: 0; }
 .score-value { font-family: var(--mono); font-size: 20px; font-weight: 500; margin-bottom: 6px; }
 .score-bar-wrap { width: 80px; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-left: auto; }
