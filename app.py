@@ -19,9 +19,12 @@ from flask import Flask, request, jsonify, render_template
 from collections import OrderedDict
 from dotenv import load_dotenv
 import json
+import logging
 import math
 import os
+import re
 import requests
+import yaml
 
 # .env 파일이 있으면 환경변수로 로드 (없으면 조용히 무시)
 load_dotenv()
@@ -104,12 +107,20 @@ def normalize(scores):
 # ──────────────────────────────────────────
 # Heap Sort (점수 내림차순)
 # ──────────────────────────────────────────
+def _rank_key(ch):
+    """정렬 우선순위 키.
+    1차: 점수 내림차순, 2차: 구독 기간 내림차순(= 구독 시작일이 빠른 순),
+    3차: 원래 입력 순서 보존(heap_sort_desc가 _order를 부여) → 동점도 결정론적 = 안정 정렬.
+    """
+    return (ch["score"], ch.get("subMonths", 0), -ch.get("_order", 0))
+
+
 def _heapify(arr, n, i):
     largest = i
     l, r = 2 * i + 1, 2 * i + 2
-    if l < n and arr[l]["score"] > arr[largest]["score"]:
+    if l < n and _rank_key(arr[l]) > _rank_key(arr[largest]):
         largest = l
-    if r < n and arr[r]["score"] > arr[largest]["score"]:
+    if r < n and _rank_key(arr[r]) > _rank_key(arr[largest]):
         largest = r
     if largest != i:
         arr[i], arr[largest] = arr[largest], arr[i]
@@ -119,12 +130,17 @@ def _heapify(arr, n, i):
 def heap_sort_desc(channels):
     a = list(channels)
     n = len(a)
+    # 안정 정렬 보장용 입력 순서 인덱스 — 점수·구독기간이 모두 같아도 원래 순서를 유지한다.
+    for idx, ch in enumerate(a):
+        ch["_order"] = idx
     for i in range(n // 2 - 1, -1, -1):
         _heapify(a, n, i)
     for i in range(n - 1, 0, -1):
         a[0], a[i] = a[i], a[0]
         _heapify(a, i, 0)
     a.reverse()
+    for ch in a:
+        ch.pop("_order", None)  # 응답 객체에 내부용 인덱스를 남기지 않는다
     return a
 
 
@@ -152,6 +168,183 @@ def get_group(score):
 
 
 # ──────────────────────────────────────────
+# 카테고리 분류 (키워드 매칭 기반·결정론적)
+#   채널의 name + description(+ 최근 영상 제목)에 category_list.yaml의
+#   키워드를 매칭해 "카테고리"(대분류)와 "상세"(소분류)를 판정한다.
+#   추가 API/LLM 호출 없음 → 같은 입력이면 항상 같은 결과, 비용 0.
+# ──────────────────────────────────────────
+CATEGORY_LIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_list.yaml")
+# 어느 카테고리에도 매칭되지 않은 채널에 부여할 라벨
+UNCLASSIFIED_CATEGORY = "기타"
+
+
+def load_category_list(path=CATEGORY_LIST_PATH):
+    """category_list.yaml을 읽어 분류기가 바로 쓸 수 있는 형태로 컴파일한다.
+
+    반환: {version, top_n, rules:[(category, detail, keyword, weight, pattern)]}
+      - pattern is None  → 한국어 키워드: 부분 문자열 매칭
+      - pattern is regex → 영어/숫자 키워드: 단어 경계 매칭(오탐 방지)
+    """
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    weights = data.get("weights") or {}
+    w_core = float(weights.get("core", 3))
+    w_general = float(weights.get("general", 1))
+    top_n = int(data.get("top_n", 3))
+    stopwords = {str(s).strip().lower() for s in (data.get("stopwords") or []) if str(s).strip()}
+
+    rules = []
+    for category, details in (data.get("categories") or {}).items():
+        for detail, kw_groups in (details or {}).items():
+            for group, weight in (("core", w_core), ("general", w_general)):
+                for kw in ((kw_groups or {}).get(group) or []):
+                    k = str(kw).strip().lower()
+                    if not k or k in stopwords:
+                        continue
+                    if k.isascii():
+                        # 영어/숫자는 단어 경계로만 매칭("ai"가 "email"에 걸리지 않도록)
+                        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])")
+                    else:
+                        pattern = None  # 한국어는 부분 문자열 매칭
+                    rules.append((category, detail, k, weight, pattern))
+
+    return {"version": data.get("version", 0), "top_n": top_n, "rules": rules}
+
+
+# 서버 시작 시 1회 로드 (이후 매 분석 요청은 메모리의 컴파일 결과만 사용)
+CATEGORY_LIST = load_category_list()
+CATEGORY_VERSION = CATEGORY_LIST["version"]
+logging.getLogger(__name__).info(
+    "[classify] 카테고리 목록 v%s 로드 (규칙 %d개)", CATEGORY_VERSION, len(CATEGORY_LIST["rules"])
+)
+
+
+def classify_channel(ch, model=CATEGORY_LIST):
+    """채널 1개를 분류해 {category, detail, categoryScores}를 반환한다.
+
+    categoryScores는 0이 아닌 상위 N개 카테고리를 합이 1이 되도록 정규화한 벡터
+    (예: {"개발/IT": 0.62, "교육": 0.38}). category는 그 argmax, detail은
+    대표 카테고리 안에서 점수가 가장 높은 상세다. 매칭이 전혀 없으면 "기타".
+    """
+    parts = [ch.get("name") or "", ch.get("description") or ""]
+    titles = ch.get("videoTitles")
+    if isinstance(titles, list):
+        parts.extend(str(t) for t in titles)
+    text = " ".join(parts).lower()
+
+    cat_scores = {}
+    detail_scores = {}
+    for category, detail, kw, weight, pattern in model["rules"]:
+        hit = (kw in text) if pattern is None else (pattern.search(text) is not None)
+        if not hit:
+            continue
+        cat_scores[category] = cat_scores.get(category, 0) + weight
+        dkey = (category, detail)
+        detail_scores[dkey] = detail_scores.get(dkey, 0) + weight
+
+    if not cat_scores:
+        return {"category": UNCLASSIFIED_CATEGORY, "detail": "", "categoryScores": {}}
+
+    # 대표 카테고리: argmax. 동점이면 목록(파일) 정의 순서가 앞선 쪽이 이긴다(삽입순 유지).
+    top_cat = max(cat_scores, key=lambda c: cat_scores[c])
+
+    # 대표 상세: 대표 카테고리 안에서 점수가 가장 높은 상세
+    top_detail, best = "", -1
+    for (category, detail), score in detail_scores.items():
+        if category == top_cat and score > best:
+            best, top_detail = score, detail
+
+    # 0이 아닌 상위 N개를 합이 1이 되도록 정규화
+    top_items = sorted(cat_scores.items(), key=lambda x: -x[1])[: model["top_n"]]
+    total = sum(s for _, s in top_items)
+    vector = {c: round(s / total, 2) for c, s in top_items} if total else {}
+    return {"category": top_cat, "detail": top_detail, "categoryScores": vector}
+
+
+# 분류 결과 캐시. 키에 CATEGORY_VERSION을 포함 → 목록(파일)을 고쳐 version을 올리면 자동 무효화.
+classify_cache = LRUCache(1000)
+
+
+def classify_cached(ch):
+    titles = ch.get("videoTitles")
+    key = (
+        CATEGORY_VERSION,
+        ch.get("id"),
+        ch.get("name") or "",
+        ch.get("description") or "",
+        tuple(titles) if isinstance(titles, list) else (),
+    )
+    cached = classify_cache.get(key)
+    if cached is not None:
+        return cached
+    val = classify_channel(ch)
+    classify_cache.set(key, val)
+    return val
+
+
+# ──────────────────────────────────────────
+# 코사인 유사도 (카테고리 벡터 기반)
+#   분류 결과 categoryScores 벡터를 재사용 → 추가 API 호출 없이:
+#     - representativeness: 내 취향 중심(centroid) 대비 채널의 대표성 (0~1)
+#     - similar: 같은 구독 목록 안에서 카테고리적으로 가장 비슷한 채널 Top N
+# ──────────────────────────────────────────
+def cosine_similarity(v1, v2):
+    """두 희소 카테고리 벡터(dict)의 코사인 유사도. 빈 벡터/무교집합이면 0."""
+    if not v1 or not v2:
+        return 0.0
+    dot = sum(w * v2[k] for k, w in v1.items() if k in v2)
+    if dot == 0.0:
+        return 0.0
+    n1 = math.sqrt(sum(w * w for w in v1.values()))
+    n2 = math.sqrt(sum(w * w for w in v2.values()))
+    if n1 == 0.0 or n2 == 0.0:
+        return 0.0
+    return dot / (n1 * n2)
+
+
+def attach_similarity(scored, top_k=3):
+    """scored 채널들에 representativeness/similar 필드를 얹는다(점수·정렬엔 영향 없음)."""
+    vecs = [(ch, ch.get("categoryScores") or {}) for ch in scored]
+
+    # 취향 중심(centroid): 각 채널 벡터를 관심도 점수로 가중 합산.
+    # 활동이 있는(점수>0) 채널이 취향을 정의한다. 전부 0점이면 균등 가중으로 폴백.
+    centroid = {}
+    for ch, v in vecs:
+        w = ch.get("score", 0)
+        if w <= 0 or not v:
+            continue
+        for k, val in v.items():
+            centroid[k] = centroid.get(k, 0.0) + w * val
+    if not centroid:
+        for ch, v in vecs:
+            for k, val in v.items():
+                centroid[k] = centroid.get(k, 0.0) + val
+
+    for ch, v in vecs:
+        ch["representativeness"] = round(cosine_similarity(v, centroid), 2) if v else 0.0
+
+    # 채널 간 유사도 Top-K — 벡터가 있는 채널끼리만 비교 (O(n²)·작은 벡터라 저렴)
+    nonempty = [(ch, v) for ch, v in vecs if v]
+    for ch, v in nonempty:
+        sims = []
+        for other, ov in nonempty:
+            if other is ch:
+                continue
+            s = cosine_similarity(v, ov)
+            if s > 0:
+                sims.append((s, other))
+        sims.sort(key=lambda x: (-x[0], x[1].get("name") or ""))  # 유사도 내림차순, 이름으로 tie-break
+        ch["similar"] = [
+            {"id": o.get("id"), "name": o.get("name"), "similarity": round(s, 2)}
+            for s, o in sims[:top_k]
+        ]
+    for ch, v in vecs:
+        ch.setdefault("similar", [])  # 분류 안 된 채널은 빈 리스트
+    return scored
+
+
+# ──────────────────────────────────────────
 # 분석 파이프라인
 # ──────────────────────────────────────────
 def analyze_channels(channels):
@@ -176,9 +369,26 @@ def analyze_channels(channels):
 
     normalized = normalize(raw_scores)
     scored = []
+    unclassified = 0
     for i, ch in enumerate(channels):
         s = normalized[i]
-        scored.append({**ch, "score": s, "group": get_group(s)})
+        # 키워드 매칭 분류 결과를 채널 객체에 얹는다(점수/정렬 로직은 그대로).
+        # category/detail/categoryScores가 기존 하드코딩 '채널'을 대체한다.
+        cls = classify_cached(ch)
+        if cls["category"] == UNCLASSIFIED_CATEGORY:
+            unclassified += 1
+        scored.append({**ch, "score": s, "group": get_group(s), **cls})
+
+    # 미분류 비율을 로그로 — 높으면 category_list.yaml 키워드 보강이 필요하다는 신호.
+    if channels:
+        ratio = unclassified / len(channels) * 100
+        app.logger.info(
+            "[classify] 미분류 %d/%d (%.1f%%) · 카테고리 목록 v%s",
+            unclassified, len(channels), ratio, CATEGORY_VERSION,
+        )
+
+    # 카테고리 벡터 기반 코사인 유사도(취향 대표성 + 비슷한 채널)를 얹는다.
+    attach_similarity(scored)
     return heap_sort_desc(scored)
 
 

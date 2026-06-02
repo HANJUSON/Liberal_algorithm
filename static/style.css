@@ -380,6 +380,9 @@ input::placeholder { color: var(--text3); }
 .channel-meta { display: flex; gap: 12px; flex-wrap: wrap; }
 .meta-tag { font-family: var(--mono); font-size: 10px; color: var(--text2); display: flex; align-items: center; gap: 4px; }
 .meta-tag .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--text3); }
+.meta-tag.meta-cat { color: var(--accent2); }
+.meta-tag.meta-cat .dot { background: var(--accent2); }
+.channel-similar { margin-top: 5px; font-family: var(--mono); font-size: 10px; color: var(--text3); }
 .score-section { text-align: right; flex-shrink: 0; }
 .score-value { font-family: var(--mono); font-size: 20px; font-weight: 500; margin-bottom: 6px; }
 .score-bar-wrap { width: 80px; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-left: auto; }

@@ -1217,10 +1217,16 @@ function renderList(channels) {
         <div class="channel-info">
           <div class="channel-name">${ch.name}</div>
           <div class="channel-meta">
+            ${(ch.category && ch.category !== '채널' && ch.category !== '기타')
+              ? `<span class="meta-tag meta-cat"><span class="dot"></span>🏷️ ${escapeHtml(ch.detail || ch.category)}</span>` : ''}
+            ${(typeof ch.representativeness === 'number' && ch.representativeness > 0)
+              ? `<span class="meta-tag"><span class="dot"></span>🎯 취향 대표성 ${Math.round(ch.representativeness * 100)}%</span>` : ''}
             <span class="meta-tag"><span class="dot"></span>댓글 ${ch.comments}개</span>
             <span class="meta-tag"><span class="dot"></span>좋아요 ${ch.likes}개</span>
             <span class="meta-tag"><span class="dot"></span>구독 ${ch.subMonths}개월</span>
           </div>
+          ${(ch.similar && ch.similar.length)
+            ? `<div class="channel-similar">🔗 비슷한 채널: ${ch.similar.map(s => escapeHtml(s.name)).join(', ')}</div>` : ''}
         </div>
         <div class="score-section">
           <div class="score-value ${g.cls}">${ch.score}</div>
